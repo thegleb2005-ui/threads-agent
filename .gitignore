@@ -1,0 +1,6 @@
+.env
+agent.db
+downloads/
+__pycache__/
+venv/
+*.pyc
