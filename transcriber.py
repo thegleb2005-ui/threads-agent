@@ -14,6 +14,7 @@
 через ffmpeg, каждый кусок транскрибируется отдельно, тексты склеиваются.
 """
 import os
+import re
 import json
 import math
 import time
@@ -21,12 +22,15 @@ import asyncio
 import subprocess
 import tempfile
 
+import imageio_ffmpeg
 import requests
 
 from config import KIE_API_KEY
 
 KIE_API_BASE = "https://api.kie.ai/api/v1"
 KIE_UPLOAD_BASE = "https://kieai.redpandaai.co/api"
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 MAX_BYTES = 95 * 1024 * 1024
 CHUNK_SECONDS = 1800  # 30 минут на кусок
@@ -120,12 +124,18 @@ def _transcribe_file_sync(file_path: str) -> str:
 
 
 def _get_duration_seconds(file_path: str) -> float:
+    # ffprobe отдельно не ставим (imageio-ffmpeg даёт только ffmpeg), поэтому
+    # достаём длительность из служебного вывода самого ffmpeg — он всегда
+    # печатает "Duration: HH:MM:SS.xx" в stderr при открытии файла.
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", file_path],
-        capture_output=True, text=True, check=True,
+        [FFMPEG_PATH, "-i", file_path],
+        capture_output=True, text=True,
     )
-    return float(result.stdout.strip())
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", result.stderr)
+    if not match:
+        raise RuntimeError(f"Не удалось определить длительность файла {file_path}: {result.stderr[-500:]}")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def _split_audio(file_path: str, tmp_dir: str) -> list[str]:
@@ -136,7 +146,7 @@ def _split_audio(file_path: str, tmp_dir: str) -> list[str]:
         start = i * CHUNK_SECONDS
         chunk_path = os.path.join(tmp_dir, f"chunk_{i}.mp3")
         subprocess.run(
-            ["ffmpeg", "-y", "-i", file_path, "-ss", str(start),
+            [FFMPEG_PATH, "-y", "-i", file_path, "-ss", str(start),
              "-t", str(CHUNK_SECONDS), "-c", "copy", chunk_path],
             capture_output=True, check=True,
         )

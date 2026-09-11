@@ -1,12 +1,19 @@
 """
 Скачивание аудиодорожки из YouTube-видео через yt-dlp.
-Требует установленный ffmpeg в системе (см. README).
+
+ffmpeg не ставится через apt на всех хостингах (например, Bothost без
+Docker его не даёт), поэтому используем imageio-ffmpeg — pip-пакет,
+внутри которого уже лежит готовый статический бинарник ffmpeg. Ничего
+скачивать при старте не нужно, работает сразу после pip install.
 """
 import os
 import asyncio
+import imageio_ffmpeg
 import yt_dlp
 
 from config import DOWNLOADS_DIR
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
@@ -19,6 +26,7 @@ def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
             "preferredcodec": "mp3",
             "preferredquality": "128",
         }],
+        "ffmpeg_location": FFMPEG_PATH,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,

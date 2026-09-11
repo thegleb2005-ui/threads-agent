@@ -1,12 +1,9 @@
-# Нужен именно Docker-путь деплоя (не обычный "Python-buildpack"), потому что
-# боту требуется системный пакет ffmpeg — pip его поставить не может.
+# ffmpeg больше НЕ ставится через apt — используется imageio-ffmpeg (pip-пакет
+# со встроенным статическим бинарником), поэтому обычный Python-образ
+# без системных пакетов подходит. Этот Dockerfile нужен только если твой
+# хостинг требует явный Dockerfile для деплоя — для Bothost с native Python
+# деплоем он не обязателен вовсе.
 FROM python:3.11-slim
-
-# ffmpeg нужен для извлечения аудио (downloader.py) и нарезки длинных
-# файлов при транскрибации (transcriber.py)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
