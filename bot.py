@@ -33,7 +33,11 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be)/")
+YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/\S+|youtu\.be/\S+)")
+
+
+def _contains_youtube_link(message: Message) -> bool:
+    return bool(message.text and YOUTUBE_RE.search(message.text))
 
 
 class EditState(StatesGroup):
@@ -67,11 +71,12 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.message(F.text.regexp(YOUTUBE_RE))
+@dp.message(_contains_youtube_link)
 async def handle_link(message: Message):
     if not _is_admin(message.from_user.id):
         return
-    url = message.text.strip()
+    match = YOUTUBE_RE.search(message.text)
+    url = match.group(0)
     post_id = await add_post(url)
     await message.answer(f"✅ Добавлено в очередь (#{post_id}). Обработаю в фоне и пришлю черновик.")
 
