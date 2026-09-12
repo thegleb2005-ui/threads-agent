@@ -1,11 +1,16 @@
 """
-Централизованная конфигурация. Все значения берутся из переменных окружения
-(см. .env.example). Ничего секретного здесь не хардкодим.
+Централизованная конфигурация. Все значения берутся из файла config.env
+(см. config.env.example). Ничего секретного здесь не хардкодим.
+
+Файл называется НЕ ".env" специально — файлы с точкой в начале Finder
+на Mac скрывает по умолчанию, из-за чего их легко потерять после
+распаковки архива. "config.env" ничем не хуже для той же задачи и всегда
+виден в проводнике.
 """
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv("config.env")
 
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -56,5 +61,5 @@ def validate():
     if missing:
         raise RuntimeError(
             f"Не заданы переменные окружения: {', '.join(missing)}. "
-            f"Проверь файл .env (см. .env.example)."
+            f"Проверь файл config.env (см. config.env.example)."
         )

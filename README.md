@@ -36,8 +36,8 @@ Telegram-бот + фоновый воркер, который превращае
 | `transcriber.py`   | Распознавание речи (kie.ai, elevenlabs/speech-to-text)      |
 | `generator.py`     | Генерация текста поста (kie.ai)                             |
 | `db.py`            | Очередь на SQLite                                           |
-| `config.py`        | Загрузка настроек из `.env`                                 |
-| `.env.example`     | Шаблон переменных окружения — скопируй в `.env` и заполни   |
+| `config.py`        | Загрузка настроек из `config.env`                                 |
+| `config.env.example`     | Шаблон переменных окружения — скопируй в `config.env` и заполни   |
 | `Dockerfile`       | Для деплоя на Bothost — ставит ffmpeg + Python-зависимости   |
 | `threads_api.py`   | ⏸ Не используется сейчас. Публикация в Threads — готова, но не подключена (см. ниже) |
 | `scheduler.py`     | ⏸ Не используется сейчас. Автопубликация по расписанию — готова, но не подключена  |
@@ -65,7 +65,7 @@ Telegram-бот + фоновый воркер, который превращае
 ### kie.ai (транскрибация + генерация текста)
 Один и тот же ключ используется для двух задач:
 
-1. **Транскрибация** — два переключаемых варианта (`TRANSCRIBE_PROVIDER` в `.env`):
+1. **Транскрибация** — два переключаемых варианта (`TRANSCRIBE_PROVIDER` в `config.env`):
    - `elevenlabs` (по умолчанию) — модель `elevenlabs/speech-to-text` через
      асинхронные `jobs/createTask`/`jobs/recordInfo`. На практике может
      таймаутить или зависать на стороне kie.ai — код это уже обрабатывает
@@ -77,7 +77,7 @@ Telegram-бот + фоновый воркер, который превращае
 2. **Генерация текста поста** — используй тот же ключ и модель `gpt-5-2`,
    что уже настроены у тебя в pptx-bot.
 
-Пропиши `KIE_API_KEY` в `.env`. Если `elevenlabs` продолжит давать сбои —
+Пропиши `KIE_API_KEY` в `config.env`. Если `elevenlabs` продолжит давать сбои —
 попробуй переключить `TRANSCRIBE_PROVIDER=gemini` и посмотри, стабильнее ли.
 
 ## 3. Настройка проекта
@@ -88,8 +88,8 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env
-nano .env   # заполни TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, KIE_API_KEY
+cp config.env.example config.env
+nano config.env   # заполни TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, KIE_API_KEY
 ```
 
 Поля `THREADS_USER_ID` / `THREADS_ACCESS_TOKEN` можно оставить пустыми —
@@ -148,13 +148,13 @@ Telegram `/start`, потом кинь ссылку на короткое (5-10 
 - `threads_api.py` — функция `publish_post(text)`, которая публикует текст
   в Threads через Meta Graph API.
 - `scheduler.py` — берёт одобренные посты и публикует их по расписанию
-  (`POST_TIMES` в `.env`).
+  (`POST_TIMES` в `config.env`).
 - `scripts/get_threads_token.py` / `refresh_threads_token.py` — получение и
   обновление токенов Threads API (инструкция по получению самих App ID/Secret
   разбирали отдельно — она не изменилась).
 
 Когда решишь включить:
-1. Получи `THREADS_USER_ID` и `THREADS_ACCESS_TOKEN` через `scripts/get_threads_token.py`, впиши в `.env`.
+1. Получи `THREADS_USER_ID` и `THREADS_ACCESS_TOKEN` через `scripts/get_threads_token.py`, впиши в `config.env`.
 2. В `bot.py` верни `from scheduler import setup_scheduler` и вызов `setup_scheduler(bot, config.ADMIN_USER_ID)` в `main()`.
 3. Замени кнопку "✅ Готово" обратно на "✅ Одобрить" со статусом `approved` — тогда `scheduler.py` подхватит пост и опубликует его в ближайший слот расписания.
 4. Верни `apscheduler` в `requirements.txt` (сейчас закомментирован).
