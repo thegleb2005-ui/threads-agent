@@ -29,12 +29,13 @@ import tempfile
 import imageio_ffmpeg
 import requests
 
-from config import KIE_API_KEY
+from config import KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL
 
 logger = logging.getLogger(__name__)
 
 KIE_API_BASE = "https://api.kie.ai/api/v1"
 KIE_UPLOAD_BASE = "https://kieai.redpandaai.co/api"
+KIE_GEMINI_URL_TMPL = "https://api.kie.ai/{model}/v1/chat/completions"
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -150,9 +151,9 @@ def _extract_text(result: dict) -> str:
     raise RuntimeError(f"Не удалось извлечь текст из ответа kie.ai: {result}")
 
 
-def _transcribe_file_sync(file_path: str) -> str:
-    """Транскрибирует один файл (уже достаточно короткий кусок). При
-    таймауте upstream — повторяет попытку до MAX_TIMEOUT_RETRIES раз."""
+def _transcribe_via_elevenlabs(file_path: str) -> str:
+    """Транскрибирует один файл через elevenlabs/speech-to-text (async job).
+    При таймауте upstream — повторяет попытку до MAX_TIMEOUT_RETRIES раз."""
     last_error = None
     for attempt in range(1, MAX_TIMEOUT_RETRIES + 2):  # 1 обычная + N повторов
         try:
@@ -171,6 +172,79 @@ def _transcribe_file_sync(file_path: str) -> str:
                 continue
             raise
     raise last_error
+
+
+def _transcribe_via_gemini(file_path: str) -> str:
+    """Транскрибирует файл через мультимодальный чат-запрос к Gemini.
+
+    ЭКСПЕРИМЕНТАЛЬНЫЙ путь: официальный пример kie.ai для Gemini показывает
+    передачу файла по ссылке через content-блок типа "image_url" (несмотря
+    на название, так передаются файлы вообще, не только картинки) — но
+    именно для аудио это нигде явно не задокументировано. Работает быстрее
+    и проще ElevenLabs-варианта (один синхронный запрос, без очереди задач),
+    но если не сработает совсем — возвращайся на TRANSCRIBE_PROVIDER=elevenlabs.
+    """
+    audio_url = _upload_file(file_path)
+    url = KIE_GEMINI_URL_TMPL.format(model=GEMINI_MODEL)
+
+    last_error = None
+    for attempt in range(1, MAX_TIMEOUT_RETRIES + 2):
+        try:
+            resp = requests.post(
+                url,
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Transcribe this audio file exactly, word for word, "
+                                        "in the original spoken language. Return ONLY the "
+                                        "transcript text, no commentary, no timestamps, "
+                                        "no speaker labels."
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": audio_url,
+                                        "mime_type": "audio/mpeg",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                },
+                timeout=180,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            text = payload["choices"][0]["message"]["content"]
+            if not text or not text.strip():
+                raise RuntimeError(f"Gemini вернул пустой транскрипт: {payload}")
+            return text.strip()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            logger.warning(
+                f"Сетевая ошибка при обращении к Gemini (попытка "
+                f"{attempt}/{MAX_TIMEOUT_RETRIES + 1}) для {file_path}: {e}"
+            )
+            if attempt <= MAX_TIMEOUT_RETRIES:
+                time.sleep(5)
+                continue
+            raise
+    raise last_error
+
+
+def _transcribe_file_sync(file_path: str) -> str:
+    """Транскрибирует один файл (уже достаточно короткий кусок) выбранным
+    в конфиге движком (TRANSCRIBE_PROVIDER)."""
+    if TRANSCRIBE_PROVIDER == "gemini":
+        return _transcribe_via_gemini(file_path)
+    return _transcribe_via_elevenlabs(file_path)
 
 
 def _get_duration_seconds(file_path: str) -> float:

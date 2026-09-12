@@ -11,11 +11,18 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 
-# --- kie.ai используется и для транскрибации (elevenlabs/speech-to-text),
-#     и для генерации текста поста (OpenAI-совместимый chat completions) ---
+# --- kie.ai используется и для транскрибации, и для генерации текста поста ---
 KIE_API_KEY = os.getenv("KIE_API_KEY", "")
 KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai/v1")
 KIE_MODEL = os.getenv("KIE_MODEL", "gpt-5-2")
+
+# Какой движок использовать для распознавания речи:
+#   "elevenlabs" — модель elevenlabs/speech-to-text через асинхронные jobs
+#                  (умеет глючить/таймаутить на стороне kie.ai)
+#   "gemini"     — через мультимодальный чат-запрос к Gemini (эксперимент,
+#                  но проще: один синхронный запрос, без очереди задач)
+TRANSCRIBE_PROVIDER = os.getenv("TRANSCRIBE_PROVIDER", "elevenlabs")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # --- Threads (Meta Graph API) — пока НЕ используется, публикация ручная.
 #     Переменные оставлены на случай, если решишь включить автопубликацию
