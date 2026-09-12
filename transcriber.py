@@ -8,16 +8,20 @@
   3. Опрашиваем статус задачи, пока не станет success/fail.
   4. Достаём готовый текст из результата.
 
-Явного лимита на длину аудио в документации kie.ai для этой модели нет,
-но на всякий случай (и по аналогии с рекомендацией kie.ai по размеру
-файла при загрузке) файлы больше ~95 МБ режутся на получасовые куски
-через ffmpeg, каждый кусок транскрибируется отдельно, тексты склеиваются.
+ВАЖНО: у kie.ai/ElevenLabs, судя по всему, есть свой внутренний лимит
+по ВРЕМЕНИ обработки одного запроса (не по размеру файла) — на практике
+файлы длиннее ~15 минут аудио могут прилетать назад с ошибкой
+"upstream API service timed out" даже если сам mp3 весит немного.
+Поэтому режем на куски по ДЛИТЕЛЬНОСТИ (не по байтам), с запасом.
+Плюс: если задача всё равно упала с таймаутом на стороне kie.ai,
+делаем автоматический повтор — сам kie.ai рекомендует "please try again".
 """
 import os
 import re
 import json
 import math
 import time
+import logging
 import asyncio
 import subprocess
 import tempfile
@@ -27,16 +31,19 @@ import requests
 
 from config import KIE_API_KEY
 
+logger = logging.getLogger(__name__)
+
 KIE_API_BASE = "https://api.kie.ai/api/v1"
 KIE_UPLOAD_BASE = "https://kieai.redpandaai.co/api"
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-MAX_BYTES = 95 * 1024 * 1024
-CHUNK_SECONDS = 1800  # 30 минут на кусок
+CHUNK_SECONDS = 600  # 10 минут на кусок — с запасом от предполагаемого лимита kie.ai
 
 POLL_INTERVAL_SECONDS = 5
-POLL_MAX_ATTEMPTS = 120  # до ~10 минут ожидания на один файл/кусок
+POLL_MAX_ATTEMPTS = 180  # до ~15 минут ожидания на один кусок
+
+MAX_TIMEOUT_RETRIES = 2  # сколько раз повторить кусок при таймауте upstream
 
 
 def _headers() -> dict:
@@ -84,8 +91,17 @@ def _create_stt_task(audio_url: str) -> str:
     return payload["data"]["taskId"]
 
 
+class UpstreamTimeoutError(RuntimeError):
+    """Отдельный тип ошибки — специально для таймаутов upstream (kie.ai сам
+    говорит "please try again"), чтобы можно было отличить от прочих fail
+    и автоматически повторить попытку."""
+    pass
+
+
 def _poll_task(task_id: str) -> dict:
-    for _ in range(POLL_MAX_ATTEMPTS):
+    last_state = None
+    last_progress = None
+    for attempt in range(POLL_MAX_ATTEMPTS):
         resp = requests.get(
             f"{KIE_API_BASE}/jobs/recordInfo",
             headers=_headers(),
@@ -95,18 +111,36 @@ def _poll_task(task_id: str) -> dict:
         resp.raise_for_status()
         data = resp.json()["data"]
         state = data.get("state")
+        last_state = state
+        last_progress = data.get("progress")
+
+        if attempt % 12 == 0:
+            logger.info(
+                f"kie.ai task {task_id}: state={state}, progress={last_progress}, "
+                f"попытка {attempt + 1}/{POLL_MAX_ATTEMPTS}"
+            )
+
         if state == "success":
             return json.loads(data["resultJson"])
         if state == "fail":
-            raise RuntimeError(f"Транскрибация не удалась: {data.get('failMsg')}")
+            fail_msg = data.get("failMsg") or ""
+            if "timed out" in fail_msg.lower() or data.get("failCode") == "500":
+                raise UpstreamTimeoutError(
+                    f"Таймаут на стороне kie.ai (task {task_id}): {fail_msg}"
+                )
+            raise RuntimeError(f"Транскрибация не удалась (task {task_id}): {fail_msg}")
         time.sleep(POLL_INTERVAL_SECONDS)
-    raise TimeoutError(f"Транскрибация не завершилась за отведённое время (task {task_id})")
+
+    raise TimeoutError(
+        f"Транскрибация не завершилась за отведённое время (task {task_id}). "
+        f"Последний известный статус: state={last_state}, progress={last_progress}. "
+        f"Проверь статус задачи вручную: "
+        f"curl -H 'Authorization: Bearer <твой KIE_API_KEY>' "
+        f"'https://api.kie.ai/api/v1/jobs/recordInfo?taskId={task_id}'"
+    )
 
 
 def _extract_text(result: dict) -> str:
-    # ElevenLabs STT обычно отдаёт {"text": "...", "language_code": "...", ...}.
-    # На случай, если kie.ai обернёт ответ иначе (например, ссылкой на файл
-    # с результатом), пробуем запасной вариант, а не падаем молча.
     if "text" in result:
         return result["text"]
     if result.get("resultUrls"):
@@ -117,10 +151,26 @@ def _extract_text(result: dict) -> str:
 
 
 def _transcribe_file_sync(file_path: str) -> str:
-    audio_url = _upload_file(file_path)
-    task_id = _create_stt_task(audio_url)
-    result = _poll_task(task_id)
-    return _extract_text(result)
+    """Транскрибирует один файл (уже достаточно короткий кусок). При
+    таймауте upstream — повторяет попытку до MAX_TIMEOUT_RETRIES раз."""
+    last_error = None
+    for attempt in range(1, MAX_TIMEOUT_RETRIES + 2):  # 1 обычная + N повторов
+        try:
+            audio_url = _upload_file(file_path)
+            task_id = _create_stt_task(audio_url)
+            result = _poll_task(task_id)
+            return _extract_text(result)
+        except UpstreamTimeoutError as e:
+            last_error = e
+            logger.warning(
+                f"Таймаут upstream на попытке {attempt}/{MAX_TIMEOUT_RETRIES + 1} "
+                f"для {file_path}: {e}"
+            )
+            if attempt <= MAX_TIMEOUT_RETRIES:
+                time.sleep(5)
+                continue
+            raise
+    raise last_error
 
 
 def _get_duration_seconds(file_path: str) -> float:
@@ -155,9 +205,15 @@ def _split_audio(file_path: str, tmp_dir: str) -> list[str]:
 
 
 def _transcribe_sync(file_path: str) -> str:
-    if os.path.getsize(file_path) <= MAX_BYTES:
+    duration = _get_duration_seconds(file_path)
+    logger.info(f"Длительность файла {file_path}: {duration:.0f} сек")
+
+    if duration <= CHUNK_SECONDS:
         return _transcribe_file_sync(file_path)
 
+    logger.info(
+        f"Файл длиннее {CHUNK_SECONDS} сек — режем на куски перед отправкой в kie.ai"
+    )
     with tempfile.TemporaryDirectory() as tmp_dir:
         chunks = _split_audio(file_path, tmp_dir)
         texts = [_transcribe_file_sync(chunk) for chunk in chunks]
