@@ -2,15 +2,18 @@
 Хранилище очереди постов на SQLite (через aiosqlite, асинхронно).
 
 Жизненный цикл записи (поле status):
-  queued        -> ссылка добавлена, ждёт обработки воркером
-  downloading   -> качается аудио
-  transcribing  -> идёт распознавание речи
-  generating    -> LLM пишет черновик поста
-  draft_ready   -> черновик готов, ждёт решения админа в Telegram
-  approved      -> админ одобрил, ждёт своего слота в расписании публикации
-  published     -> опубликовано в Threads
-  rejected      -> админ удалил черновик
-  error         -> что-то упало на любом из шагов (см. error_message)
+  awaiting_prompt -> ссылка добавлена, бот ждёт, какой промпт использовать
+                     (индивидуальный текстом или базовый по кнопке)
+  queued          -> промпт выбран, ждёт обработки воркером
+  downloading     -> качается аудио
+  transcribing    -> идёт распознавание речи
+  generating      -> LLM пишет черновик поста
+  draft_ready     -> черновик готов, ждёт решения админа в Telegram
+  done            -> админ пометил готовым (публикует вручную)
+  approved        -> (только при включённой автопубликации) ждёт слота
+  published       -> опубликовано в Threads
+  rejected        -> админ удалил черновик
+  error           -> что-то упало на любом из шагов (см. error_message)
 """
 import aiosqlite
 from datetime import datetime, timezone
@@ -21,16 +24,29 @@ CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_url TEXT NOT NULL,
     video_title TEXT,
-    status TEXT NOT NULL DEFAULT 'queued',
+    status TEXT NOT NULL DEFAULT 'awaiting_prompt',
+    custom_prompt TEXT,
     transcript TEXT,
     draft_text TEXT,
     threads_post_id TEXT,
     error_message TEXT,
+    status_chat_id INTEGER,
+    status_message_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     published_at TEXT
 );
 """
+
+# Колонки, которые появились позже первой версии. Для уже существующих
+# баз (например, на сервере, где бот уже работал) добавляем их через
+# ALTER TABLE — CREATE TABLE IF NOT EXISTS сам по себе старую таблицу
+# не обновляет.
+MIGRATIONS = [
+    ("custom_prompt", "ALTER TABLE posts ADD COLUMN custom_prompt TEXT"),
+    ("status_chat_id", "ALTER TABLE posts ADD COLUMN status_chat_id INTEGER"),
+    ("status_message_id", "ALTER TABLE posts ADD COLUMN status_message_id INTEGER"),
+]
 
 
 def _now() -> str:
@@ -40,6 +56,11 @@ def _now() -> str:
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(SCHEMA)
+        cursor = await db.execute("PRAGMA table_info(posts)")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for column, sql in MIGRATIONS:
+            if column not in existing:
+                await db.execute(sql)
         await db.commit()
 
 
@@ -48,7 +69,7 @@ async def add_post(source_url: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT INTO posts (source_url, status, created_at, updated_at) "
-            "VALUES (?, 'queued', ?, ?)",
+            "VALUES (?, 'awaiting_prompt', ?, ?)",
             (source_url, now, now),
         )
         await db.commit()

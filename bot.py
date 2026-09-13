@@ -1,8 +1,9 @@
 """
 Главный вход. Telegram-бот на aiogram 3.x — интерфейс управления агентом:
   - принимает ссылки на видео (YouTube, Instagram Reels, TikTok)
-  - показывает статус очереди
-  - присылает черновики постов (редактировать / готово / удалить)
+  - спрашивает, каким промптом обрабатывать: базовым или индивидуальным
+  - показывает живой статус обработки
+  - присылает черновики постов (готово / редактировать / удалить)
 
 Публикация в Threads пока ручная — бот только готовит текст, ты сам
 копируешь его и постишь. Автопубликация (threads_api.py, scheduler.py)
@@ -24,7 +25,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
-from db import init_db, add_post, update_post, get_posts_by_status
+from db import init_db, add_post, update_post, get_post, get_posts_by_status
 from worker import process_queue_forever
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,8 +52,20 @@ def _contains_video_link(message: Message) -> bool:
     return bool(message.text and VIDEO_LINK_RE.search(message.text))
 
 
+class PromptState(StatesGroup):
+    waiting_for_custom_prompt = State()
+
+
 class EditState(StatesGroup):
     waiting_for_text = State()
+
+
+def _prompt_choice_keyboard(post_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Базовый промпт", callback_data=f"baseprompt:{post_id}")
+    kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
+    kb.adjust(2)
+    return kb.as_markup()
 
 
 def _draft_keyboard(post_id: int):
@@ -68,15 +81,28 @@ def _is_admin(user_id: int) -> bool:
     return user_id == config.ADMIN_USER_ID
 
 
+async def _start_processing(post_id: int, chat_id: int, custom_prompt: str | None):
+    """Переводит пост в очередь на обработку и создаёт статусное сообщение,
+    которое воркер потом будет редактировать по ходу работы."""
+    status_msg = await bot.send_message(chat_id, f"⏳ Пост #{post_id} поставлен в очередь...")
+    await update_post(
+        post_id,
+        status="queued",
+        custom_prompt=custom_prompt,
+        status_chat_id=chat_id,
+        status_message_id=status_msg.message_id,
+    )
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not _is_admin(message.from_user.id):
         return
     await message.answer(
         "Привет! Кидай ссылку на видео (YouTube, Instagram Reels, TikTok) — "
-        "поставлю в очередь на обработку.\n\n"
-        "Когда черновик поста готов, пришлю его сюда — текст просто копируешь "
-        "и публикуешь в Threads вручную.\n\n"
+        "спрошу, каким промптом его обработать.\n\n"
+        "Можно ответить своим текстом (индивидуальная инструкция для ИИ) "
+        "или нажать кнопку базового промпта.\n\n"
         "Команды:\n"
         "/queue — что сейчас в обработке\n"
         "/pending — черновики, ожидающие решения"
@@ -84,13 +110,65 @@ async def cmd_start(message: Message):
 
 
 @dp.message(_contains_video_link)
-async def handle_link(message: Message):
+async def handle_link(message: Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         return
     match = VIDEO_LINK_RE.search(message.text)
     url = match.group(0)
     post_id = await add_post(url)
-    await message.answer(f"✅ Добавлено в очередь (#{post_id}). Обработаю в фоне и пришлю черновик.")
+
+    await state.update_data(pending_post_id=post_id)
+    await state.set_state(PromptState.waiting_for_custom_prompt)
+
+    await message.answer(
+        f"🔗 Ссылка принята (#{post_id}).\n\n"
+        f"Напиши, что сделать с этим видео — например:\n"
+        f"• «переведи текст дословно, ничего не меняя»\n"
+        f"• «сделай пост в 3 предложения, дерзкий тон»\n"
+        f"• «оставь как есть, только разбей на абзацы»\n\n"
+        f"Или жми кнопку, чтобы использовать базовый промпт.",
+        reply_markup=_prompt_choice_keyboard(post_id),
+    )
+
+
+@dp.message(PromptState.waiting_for_custom_prompt, ~F.text.startswith("/"))
+async def handle_custom_prompt(message: Message, state: FSMContext):
+    if not _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    post_id = data.get("pending_post_id")
+    if not post_id:
+        await state.clear()
+        return
+
+    custom_prompt = message.text.strip()
+    await state.clear()
+    await message.answer("🎯 Принял индивидуальный промпт, начинаю обработку.")
+    await _start_processing(post_id, message.chat.id, custom_prompt)
+
+
+@dp.callback_query(F.data.startswith("baseprompt:"))
+async def cb_base_prompt(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        return
+    post_id = int(callback.data.split(":")[1])
+    await state.clear()
+    await callback.message.edit_text(
+        callback.message.text + "\n\n📋 Использую базовый промпт."
+    )
+    await _start_processing(post_id, callback.message.chat.id, None)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cancel:"))
+async def cb_cancel(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        return
+    post_id = int(callback.data.split(":")[1])
+    await state.clear()
+    await update_post(post_id, status="rejected")
+    await callback.message.edit_text(f"❌ Отменено (#{post_id}).")
+    await callback.answer()
 
 
 @dp.message(Command("queue"))
@@ -98,7 +176,7 @@ async def cmd_queue(message: Message):
     if not _is_admin(message.from_user.id):
         return
     lines = []
-    for status in ["queued", "downloading", "transcribing", "generating"]:
+    for status in ["awaiting_prompt", "queued", "downloading", "transcribing", "generating"]:
         rows = await get_posts_by_status(status, limit=10)
         for row in rows:
             lines.append(f"#{row['id']} [{status}] {row['source_url']}")
@@ -151,7 +229,7 @@ async def cb_edit(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(EditState.waiting_for_text)
+@dp.message(EditState.waiting_for_text, ~F.text.startswith("/"))
 async def process_edit(message: Message, state: FSMContext):
     if not _is_admin(message.from_user.id):
         return
