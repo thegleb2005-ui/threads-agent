@@ -45,6 +45,12 @@ POST_STYLE_PROMPT = os.getenv("POST_STYLE_PROMPT", "")
 DB_PATH = os.getenv("DB_PATH", "agent.db")
 DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 
+# Запасной путь на случай, если YouTube всё равно блокирует скачивание
+# с IP хостинга ("Sign in to confirm you're not a bot") даже после смены
+# player_client. Путь к файлу cookies.txt, экспортированному из браузера
+# (см. README, раздел про блокировку YouTube). Пусто — не используется.
+COOKIES_FILE = os.getenv("COOKIES_FILE", "")
+
 
 def validate():
     """Проверяет, что критичные переменные заданы. Вызывается при старте бота.
