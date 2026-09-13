@@ -1,20 +1,20 @@
 """
-Распознавание речи через kie.ai (модель elevenlabs/speech-to-text).
+Распознавание речи. Три переключаемых движка (TRANSCRIBE_PROVIDER):
 
-Схема работы kie.ai для любых асинхронных задач одна и та же:
-  1. Файл должен лежать по публичной ссылке -> сначала грузим mp3
-     на их временный файловый хостинг (kieai.redpandaai.co), 3 дня хранения.
-  2. Создаём задачу транскрибации по этой ссылке -> получаем taskId.
-  3. Опрашиваем статус задачи, пока не станет success/fail.
-  4. Достаём готовый текст из результата.
+  "local" (по умолчанию) — Whisper прямо на сервере через faster-whisper.
+     Никаких сетевых запросов, никаких таймаутов чужих API, ничего не
+     нужно загружать на файловые хостинги. Модель весов скачивается один
+     раз при первом запуске с Hugging Face (~150 МБ для "base") и потом
+     кешируется на диске.
 
-ВАЖНО: у kie.ai/ElevenLabs, судя по всему, есть свой внутренний лимит
-по ВРЕМЕНИ обработки одного запроса (не по размеру файла) — на практике
-файлы длиннее ~15 минут аудио могут прилетать назад с ошибкой
-"upstream API service timed out" даже если сам mp3 весит немного.
-Поэтому режем на куски по ДЛИТЕЛЬНОСТИ (не по байтам), с запасом.
-Плюс: если задача всё равно упала с таймаутом на стороне kie.ai,
-делаем автоматический повтор — сам kie.ai рекомендует "please try again".
+  "elevenlabs" — модель elevenlabs/speech-to-text через kie.ai (асинхронные
+     jobs). Схема: залить mp3 на временный хостинг kie.ai -> создать задачу
+     -> опрашивать статус -> забрать текст. На практике может таймаутить
+     или зависать на стороне kie.ai — код это отчасти обрабатывает
+     (разбивка по длительности + автоповтор), но не даёт 100% гарантии.
+
+  "gemini" — мультимодальный чат-запрос к Gemini через kie.ai.
+     Экспериментальный путь, точный формат ответа не задокументирован.
 """
 import os
 import re
@@ -29,7 +29,7 @@ import tempfile
 import imageio_ffmpeg
 import requests
 
-from config import KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL
+from config import KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL, WHISPER_MODEL_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +222,23 @@ def _transcribe_via_gemini(file_path: str) -> str:
             )
             resp.raise_for_status()
             payload = resp.json()
-            text = payload["choices"][0]["message"]["content"]
+
+            # Некоторые шлюзы возвращают 200 с телом вида {"error": ...}
+            # вместо настоящего HTTP-статуса ошибки — проверяем явно.
+            if "error" in payload:
+                raise RuntimeError(f"kie.ai/Gemini вернул ошибку: {payload}")
+
+            try:
+                text = payload["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as parse_err:
+                # Формат ответа оказался не таким, как ожидалось — показываем
+                # сырой ответ целиком, чтобы можно было поправить парсинг,
+                # не гадая вслепую.
+                raise RuntimeError(
+                    f"Не удалось разобрать ответ Gemini (ожидали choices[0]."
+                    f"message.content): {parse_err}. Сырой ответ: {payload}"
+                ) from parse_err
+
             if not text or not text.strip():
                 raise RuntimeError(f"Gemini вернул пустой транскрипт: {payload}")
             return text.strip()
@@ -239,9 +255,36 @@ def _transcribe_via_gemini(file_path: str) -> str:
     raise last_error
 
 
+_whisper_model = None  # ленивая инициализация — модель грузится один раз при первом вызове
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(f"Загружаю модель Whisper '{WHISPER_MODEL_SIZE}' (при первом запуске скачается с Hugging Face)...")
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        logger.info("Модель Whisper загружена")
+    return _whisper_model
+
+
+def _transcribe_via_local_whisper(file_path: str) -> str:
+    """Транскрибирует файл локально через faster-whisper — без единого
+    сетевого запроса. Самый надёжный вариант, но требует достаточно
+    CPU/RAM на сервере и разового скачивания весов модели."""
+    model = _get_whisper_model()
+    segments, info = model.transcribe(file_path, beam_size=5)
+    text = " ".join(segment.text.strip() for segment in segments)
+    if not text.strip():
+        raise RuntimeError(f"Whisper вернул пустой транскрипт для {file_path} (язык: {info.language})")
+    return text.strip()
+
+
 def _transcribe_file_sync(file_path: str) -> str:
     """Транскрибирует один файл (уже достаточно короткий кусок) выбранным
     в конфиге движком (TRANSCRIBE_PROVIDER)."""
+    if TRANSCRIBE_PROVIDER == "local":
+        return _transcribe_via_local_whisper(file_path)
     if TRANSCRIBE_PROVIDER == "gemini":
         return _transcribe_via_gemini(file_path)
     return _transcribe_via_elevenlabs(file_path)
@@ -282,7 +325,10 @@ def _transcribe_sync(file_path: str) -> str:
     duration = _get_duration_seconds(file_path)
     logger.info(f"Длительность файла {file_path}: {duration:.0f} сек")
 
-    if duration <= CHUNK_SECONDS:
+    # Разбивка на куски нужна только для kie.ai (обход его лимита по
+    # времени обработки одного запроса) — локальный Whisper сам прекрасно
+    # справляется с длинными файлами без этого.
+    if TRANSCRIBE_PROVIDER == "local" or duration <= CHUNK_SECONDS:
         return _transcribe_file_sync(file_path)
 
     logger.info(

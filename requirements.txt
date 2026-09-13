@@ -6,6 +6,7 @@ aiosqlite>=0.19
 # попробуй просто поднять версию здесь до самой свежей.
 yt-dlp>=2026.1.1
 imageio-ffmpeg>=0.5
+faster-whisper>=1.0
 openai>=1.12
 requests>=2.31
 python-dotenv>=1.0

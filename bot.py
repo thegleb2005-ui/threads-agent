@@ -157,7 +157,10 @@ async def main():
     config.validate()
     await init_db()
     asyncio.create_task(process_queue_forever(bot, config.ADMIN_USER_ID))
-    logger.info("Бот запущен, жду сообщений...")
+    logger.info(
+        f"Бот запущен, жду сообщений... "
+        f"(TRANSCRIBE_PROVIDER={config.TRANSCRIBE_PROVIDER!r}, KIE_MODEL={config.KIE_MODEL!r})"
+    )
     await dp.start_polling(bot)
 
 

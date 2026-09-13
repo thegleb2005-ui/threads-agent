@@ -5,8 +5,8 @@
 Использование:
     python scripts/refresh_threads_token.py
 
-Токен для обновления берётся из THREADS_ACCESS_TOKEN в .env (через config.py).
-Новый токен нужно будет вручную обновить в .env / переменных окружения хостинга.
+Токен для обновления берётся из THREADS_ACCESS_TOKEN в config.env (через config.py).
+Новый токен нужно будет вручную обновить в config.env / переменных окружения хостинга.
 """
 import sys
 import requests
@@ -18,7 +18,7 @@ REFRESH_URL = "https://graph.threads.net/refresh_access_token"
 
 def main():
     if not THREADS_ACCESS_TOKEN:
-        print("THREADS_ACCESS_TOKEN не задан в .env")
+        print("THREADS_ACCESS_TOKEN не задан в config.env")
         sys.exit(1)
 
     resp = requests.get(
@@ -40,7 +40,7 @@ def main():
     print("Токен обновлён. Новый THREADS_ACCESS_TOKEN:\n")
     print(new_token)
     print(f"\nДействителен ещё ~{expires_in_days} дней.")
-    print("Обнови значение THREADS_ACCESS_TOKEN в .env / переменных окружения хостинга.")
+    print("Обнови значение THREADS_ACCESS_TOKEN в config.env / переменных окружения хостинга.")
 
 
 if __name__ == "__main__":

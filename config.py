@@ -22,12 +22,21 @@ KIE_BASE_URL = os.getenv("KIE_BASE_URL", "https://api.kie.ai/v1")
 KIE_MODEL = os.getenv("KIE_MODEL", "gpt-5-2")
 
 # Какой движок использовать для распознавания речи:
-#   "elevenlabs" — модель elevenlabs/speech-to-text через асинхронные jobs
-#                  (умеет глючить/таймаутить на стороне kie.ai)
-#   "gemini"     — через мультимодальный чат-запрос к Gemini (эксперимент,
-#                  но проще: один синхронный запрос, без очереди задач)
-TRANSCRIBE_PROVIDER = os.getenv("TRANSCRIBE_PROVIDER", "elevenlabs")
+#   "local"      — Whisper прямо на сервере (faster-whisper), БЕЗ сетевых
+#                  запросов вообще. Самый надёжный вариант — нет ни таймаутов,
+#                  ни странных форматов ответа, ни платного API. Модель
+#                  скачивается один раз при первом запуске (~150 МБ для "base").
+#   "elevenlabs" — модель elevenlabs/speech-to-text через kie.ai (асинхронные
+#                  jobs) — умеет глючить/таймаутить на стороне kie.ai.
+#   "gemini"     — мультимодальный чат-запрос к Gemini через kie.ai —
+#                  экспериментальный путь, формат ответа не задокументирован.
+TRANSCRIBE_PROVIDER = os.getenv("TRANSCRIBE_PROVIDER", "local")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Размер модели Whisper для локального распознавания (только если
+# TRANSCRIBE_PROVIDER=local). Варианты (от быстрого/грубого к медленному/точному):
+# tiny, base, small, medium, large-v3. "base" — разумный баланс для CPU-сервера.
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 
 # --- Threads (Meta Graph API) — пока НЕ используется, публикация ручная.
 #     Переменные оставлены на случай, если решишь включить автопубликацию

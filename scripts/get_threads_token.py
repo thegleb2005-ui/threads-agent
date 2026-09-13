@@ -2,7 +2,7 @@
 Разовый скрипт для получения THREADS_USER_ID и THREADS_ACCESS_TOKEN.
 
 Запускается один раз локально (не на сервере) — проводит через OAuth-авторизацию
-Threads и на выходе печатает готовые значения для .env файла агента.
+Threads и на выходе печатает готовые значения для config.env файла агента.
 
 Использование:
     python scripts/get_threads_token.py
@@ -116,7 +116,7 @@ def main():
     long_token = long_data["access_token"]
     expires_in_days = long_data.get("expires_in", 0) // 86400
 
-    print("\n=== Готово! Добавь в .env: ===\n")
+    print("\n=== Готово! Добавь в config.env: ===\n")
     print(f"THREADS_USER_ID={user_id}")
     print(f"THREADS_ACCESS_TOKEN={long_token}")
     print(f"\nТокен действителен ~{expires_in_days} дней. Не забудь обновлять его")
