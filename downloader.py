@@ -6,26 +6,38 @@ Docker его не даёт), поэтому используем imageio-ffmpeg
 внутри которого уже лежит готовый статический бинарник ffmpeg. Ничего
 скачивать при старте не нужно, работает сразу после pip install.
 
-YouTube отдельно блокирует запросы с серверных (датацентровых) IP —
-типичная история для любого хостинга, включая Bothost — с ошибкой
-"Sign in to confirm you're not a bot". Обходим, представляясь клиентом
-TV/Safari (player_client) — так делать не требует логина и работает
-надёжнее одних только cookies на конец 2026 года. Если этого всё равно
-не хватит (совсем "грязный" IP хостинга) — есть запасной путь через
-cookies, экспортированные из твоего браузера (см. COOKIES_FILE ниже).
+YouTube в 2026 году постоянно меняет протокол стриминга и то, какие
+"клиенты" (player_client) у yt-dlp работают, а какие внезапно ломаются —
+это открытая гонка между YouTube и разработчиками yt-dlp, конкретный
+рабочий вариант держится неделями, а не годами. Поэтому вместо одного
+жёстко зашитого клиента перебираем НЕСКОЛЬКО вариантов по очереди: если
+один сломался из-за очередного изменения на стороне YouTube, код сам
+попробует следующий, не падая сразу в ошибку.
 """
 import os
+import logging
 import asyncio
 import imageio_ffmpeg
 import yt_dlp
 
 from config import DOWNLOADS_DIR, COOKIES_FILE
 
+logger = logging.getLogger(__name__)
+
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
+# Порядок важен: пробуем от "скорее всего рабочего сейчас" к запасным.
+# Если YouTube в очередной раз что-то сломает — правь этот список первым,
+# не обязательно переписывать всю логику.
+PLAYER_CLIENT_FALLBACKS = [
+    ["default", "web_embedded"],
+    ["tv", "web_safari"],
+    ["android"],
+    ["web_safari"],
+]
 
-def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
-    os.makedirs(out_dir, exist_ok=True)
+
+def _build_ydl_opts(out_dir: str, player_clients: list[str]) -> dict:
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
@@ -35,31 +47,48 @@ def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
             "preferredquality": "128",
         }],
         "ffmpeg_location": FFMPEG_PATH,
-        # Обход блокировки "Sign in to confirm you're not a bot" — TV и
-        # web_safari клиенты сейчас проходят проверку YouTube надёжнее web-клиента,
-        # без необходимости логина.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv", "web_safari"],
-            }
-        },
+        "extractor_args": {"youtube": {"player_client": player_clients}},
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
     }
-    # Запасной путь: если задан файл с cookies (экспортированными из браузера),
-    # используем его вместе с обычным web-клиентом — но НЕ смешиваем cookies
-    # с player_client=tv, это может инвалидировать сессию в самом браузере.
+    # Запасной путь: если задан файл с cookies (экспортированными из браузера) —
+    # используем его. НЕ смешиваем cookies с клиентом "tv" — это может
+    # инвалидировать сессию в самом браузере, откуда куки экспортированы.
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["web_safari"]}}
+        safe_clients = [c for c in player_clients if c != "tv"] or ["web_safari"]
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": safe_clients}}
+    return ydl_opts
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        video_id = info["id"]
-        title = info.get("title", video_id)
-        audio_path = os.path.join(out_dir, f"{video_id}.mp3")
-        return audio_path, title
+
+def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+
+    last_error = None
+    for i, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS, start=1):
+        ydl_opts = _build_ydl_opts(out_dir, player_clients)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                video_id = info["id"]
+                title = info.get("title", video_id)
+                audio_path = os.path.join(out_dir, f"{video_id}.mp3")
+                if i > 1:
+                    logger.info(
+                        f"Скачано успешно с {i}-й попытки, "
+                        f"player_client={player_clients}"
+                    )
+                return audio_path, title
+        except yt_dlp.utils.DownloadError as e:
+            last_error = e
+            logger.warning(
+                f"player_client={player_clients} не сработал "
+                f"(попытка {i}/{len(PLAYER_CLIENT_FALLBACKS)}): {e}"
+            )
+            continue
+
+    raise last_error
 
 
 async def download_audio(url: str) -> tuple[str, str]:
