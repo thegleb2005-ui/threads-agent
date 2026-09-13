@@ -1,6 +1,6 @@
 """
 Главный вход. Telegram-бот на aiogram 3.x — интерфейс управления агентом:
-  - принимает ссылки на YouTube-видео
+  - принимает ссылки на видео (YouTube, Instagram Reels, TikTok)
   - показывает статус очереди
   - присылает черновики постов (редактировать / готово / удалить)
 
@@ -33,11 +33,22 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com/\S+|youtu\.be/\S+)")
+# Поддерживаемые площадки. yt-dlp умеет скачивать со всех трёх, но
+# Instagram и TikTok заметно агрессивнее блокируют запросы с серверных IP,
+# чем YouTube — если упрёмся в "требуется авторизация", поможет COOKIES_FILE
+# (см. README, раздел про блокировки).
+VIDEO_LINK_RE = re.compile(
+    r"(https?://)?(www\.)?("
+    r"youtube\.com/\S+|youtu\.be/\S+"
+    r"|instagram\.com/\S+"
+    r"|tiktok\.com/\S+|vm\.tiktok\.com/\S+"
+    r")",
+    re.IGNORECASE,
+)
 
 
-def _contains_youtube_link(message: Message) -> bool:
-    return bool(message.text and YOUTUBE_RE.search(message.text))
+def _contains_video_link(message: Message) -> bool:
+    return bool(message.text and VIDEO_LINK_RE.search(message.text))
 
 
 class EditState(StatesGroup):
@@ -62,7 +73,8 @@ async def cmd_start(message: Message):
     if not _is_admin(message.from_user.id):
         return
     await message.answer(
-        "Привет! Кидай ссылку на YouTube-видео — поставлю в очередь на обработку.\n\n"
+        "Привет! Кидай ссылку на видео (YouTube, Instagram Reels, TikTok) — "
+        "поставлю в очередь на обработку.\n\n"
         "Когда черновик поста готов, пришлю его сюда — текст просто копируешь "
         "и публикуешь в Threads вручную.\n\n"
         "Команды:\n"
@@ -71,11 +83,11 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.message(_contains_youtube_link)
+@dp.message(_contains_video_link)
 async def handle_link(message: Message):
     if not _is_admin(message.from_user.id):
         return
-    match = YOUTUBE_RE.search(message.text)
+    match = VIDEO_LINK_RE.search(message.text)
     url = match.group(0)
     post_id = await add_post(url)
     await message.answer(f"✅ Добавлено в очередь (#{post_id}). Обработаю в фоне и пришлю черновик.")

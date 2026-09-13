@@ -62,11 +62,20 @@ def _build_ydl_opts(out_dir: str, player_clients: list[str]) -> dict:
     return ydl_opts
 
 
+def _is_youtube(url: str) -> bool:
+    return "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+
 def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
     os.makedirs(out_dir, exist_ok=True)
 
+    # Перебор player_client имеет смысл только для YouTube — это его
+    # специфика. Для Instagram/TikTok пробуем один раз, иначе одна и та же
+    # ошибка просто повторится четыре раза подряд.
+    client_variants = PLAYER_CLIENT_FALLBACKS if _is_youtube(url) else [PLAYER_CLIENT_FALLBACKS[0]]
+
     last_error = None
-    for i, player_clients in enumerate(PLAYER_CLIENT_FALLBACKS, start=1):
+    for i, player_clients in enumerate(client_variants, start=1):
         ydl_opts = _build_ydl_opts(out_dir, player_clients)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -83,8 +92,8 @@ def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
         except yt_dlp.utils.DownloadError as e:
             last_error = e
             logger.warning(
-                f"player_client={player_clients} не сработал "
-                f"(попытка {i}/{len(PLAYER_CLIENT_FALLBACKS)}): {e}"
+                f"Не удалось скачать (попытка {i}/{len(client_variants)}, "
+                f"player_client={player_clients}): {e}"
             )
             continue
 
