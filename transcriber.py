@@ -325,18 +325,20 @@ def _transcribe_sync(file_path: str) -> str:
     duration = _get_duration_seconds(file_path)
     logger.info(f"Длительность файла {file_path}: {duration:.0f} сек")
 
-    # Разбивка на куски нужна только для kie.ai (обход его лимита по
-    # времени обработки одного запроса) — локальный Whisper сам прекрасно
-    # справляется с длинными файлами без этого.
-    if TRANSCRIBE_PROVIDER == "local" or duration <= CHUNK_SECONDS:
+    # Разбивка на куски нужна для ВСЕХ движков: kie.ai — из-за лимита по
+    # времени обработки запроса, локальный Whisper — из-за оперативной
+    # памяти (длинный файл целиком в памяти на слабом сервере = OOM-килл
+    # процесса). Порог тот же (CHUNK_SECONDS), причина просто разная.
+    if duration <= CHUNK_SECONDS:
         return _transcribe_file_sync(file_path)
 
-    logger.info(
-        f"Файл длиннее {CHUNK_SECONDS} сек — режем на куски перед отправкой в kie.ai"
-    )
+    logger.info(f"Файл длиннее {CHUNK_SECONDS} сек — режу на куски перед распознаванием")
     with tempfile.TemporaryDirectory() as tmp_dir:
         chunks = _split_audio(file_path, tmp_dir)
-        texts = [_transcribe_file_sync(chunk) for chunk in chunks]
+        texts = []
+        for i, chunk in enumerate(chunks, start=1):
+            logger.info(f"Распознаю кусок {i}/{len(chunks)}")
+            texts.append(_transcribe_file_sync(chunk))
     return " ".join(texts)
 
 

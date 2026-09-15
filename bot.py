@@ -25,7 +25,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
-from db import init_db, add_post, update_post, get_post, get_posts_by_status
+from db import init_db, recover_stuck_posts, add_post, update_post, get_post, get_posts_by_status
 from worker import process_queue_forever
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -246,11 +246,28 @@ async def process_edit(message: Message, state: FSMContext):
 async def main():
     config.validate()
     await init_db()
+
+    recovered = await recover_stuck_posts()
+    if recovered:
+        logger.warning(f"Восстановлено {recovered} зависших поста(ов) после предыдущего сбоя")
+
     asyncio.create_task(process_queue_forever(bot, config.ADMIN_USER_ID))
     logger.info(
         f"Бот запущен, жду сообщений... "
         f"(TRANSCRIBE_PROVIDER={config.TRANSCRIBE_PROVIDER!r}, KIE_MODEL={config.KIE_MODEL!r})"
     )
+
+    if recovered:
+        try:
+            await bot.send_message(
+                config.ADMIN_USER_ID,
+                f"⚠️ Бот перезапустился и вернул в очередь {recovered} зависший "
+                f"пост(ов) — вероятно, прошлый процесс упал во время обработки. "
+                f"Обработаю их заново."
+            )
+        except Exception:
+            pass
+
     await dp.start_polling(bot)
 
 

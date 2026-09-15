@@ -94,6 +94,26 @@ async def get_post(post_id: int):
         return await cursor.fetchone()
 
 
+async def recover_stuck_posts() -> int:
+    """Возвращает в очередь посты, застрявшие в процессе обработки —
+    такое бывает, если процесс упал (например, из-за нехватки памяти на
+    длинном видео) прямо посреди шага. Без этого такая запись зависает
+    в статусе 'downloading'/'transcribing'/'generating' навсегда, и её
+    никто не подхватит. Вызывается один раз при старте бота.
+    Возвращает количество восстановленных записей."""
+    stuck_statuses = ("downloading", "transcribing", "generating")
+    now = _now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        placeholders = ",".join("?" for _ in stuck_statuses)
+        cursor = await db.execute(
+            f"UPDATE posts SET status = 'queued', updated_at = ? "
+            f"WHERE status IN ({placeholders})",
+            (now, *stuck_statuses),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
 async def get_posts_by_status(status: str, limit: int = 20):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
