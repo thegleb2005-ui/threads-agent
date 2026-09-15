@@ -28,16 +28,21 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 # Порядок важен: пробуем от "скорее всего рабочего сейчас" к запасным.
 # Если YouTube в очередной раз что-то сломает — правь этот список первым,
-# не обязательно переписывать всю логику.
+# не обязательно переписывать всю логику. None в конце — не подменяем
+# клиента вообще, пусть yt-dlp сам решает (иногда это надёжнее любого
+# конкретного клиента, если YouTube сломал именно наши явные варианты).
 PLAYER_CLIENT_FALLBACKS = [
     ["default", "web_embedded"],
     ["tv", "web_safari"],
+    ["ios"],
     ["android"],
+    ["mweb"],
     ["web_safari"],
+    None,
 ]
 
 
-def _build_ydl_opts(out_dir: str, player_clients: list[str]) -> dict:
+def _build_ydl_opts(out_dir: str, player_clients: list[str] | None) -> dict:
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
@@ -47,17 +52,19 @@ def _build_ydl_opts(out_dir: str, player_clients: list[str]) -> dict:
             "preferredquality": "128",
         }],
         "ffmpeg_location": FFMPEG_PATH,
-        "extractor_args": {"youtube": {"player_client": player_clients}},
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
     }
+    if player_clients is not None:
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+
     # Запасной путь: если задан файл с cookies (экспортированными из браузера) —
     # используем его. НЕ смешиваем cookies с клиентом "tv" — это может
     # инвалидировать сессию в самом браузере, откуда куки экспортированы.
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
-        safe_clients = [c for c in player_clients if c != "tv"] or ["web_safari"]
+        safe_clients = [c for c in (player_clients or []) if c != "tv"] or ["web_safari"]
         ydl_opts["extractor_args"] = {"youtube": {"player_client": safe_clients}}
     return ydl_opts
 
