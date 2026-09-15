@@ -25,11 +25,15 @@ import logging
 import asyncio
 import subprocess
 import tempfile
+import multiprocessing as mp
 
 import imageio_ffmpeg
 import requests
 
-from config import KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL, WHISPER_MODEL_SIZE
+from config import (
+    KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL,
+    WHISPER_MODEL_SIZE, WHISPER_SUBPROCESS_TIMEOUT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,29 +259,64 @@ def _transcribe_via_gemini(file_path: str) -> str:
     raise last_error
 
 
-_whisper_model = None  # ленивая инициализация — модель грузится один раз при первом вызове
-
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
+def _whisper_subprocess_worker(file_path: str, model_size: str, queue) -> None:
+    """Выполняется В ОТДЕЛЬНОМ ПРОЦЕССЕ (см. _transcribe_via_local_whisper).
+    Загружает модель, распознаёт файл, кладёт результат в очередь и завершается.
+    Не импортируем faster_whisper на уровне модуля — только здесь, внутри
+    дочернего процесса, чтобы не тянуть лишнее в родительский процесс бота."""
+    try:
         from faster_whisper import WhisperModel
-        logger.info(f"Загружаю модель Whisper '{WHISPER_MODEL_SIZE}' (при первом запуске скачается с Hugging Face)...")
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-        logger.info("Модель Whisper загружена")
-    return _whisper_model
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(file_path, beam_size=5)
+        text = " ".join(segment.text.strip() for segment in segments)
+        queue.put(("ok", text))
+    except Exception as e:
+        queue.put(("error", f"{type(e).__name__}: {e}"))
 
 
 def _transcribe_via_local_whisper(file_path: str) -> str:
-    """Транскрибирует файл локально через faster-whisper — без единого
-    сетевого запроса. Самый надёжный вариант, но требует достаточно
-    CPU/RAM на сервере и разового скачивания весов модели."""
-    model = _get_whisper_model()
-    segments, info = model.transcribe(file_path, beam_size=5)
-    text = " ".join(segment.text.strip() for segment in segments)
-    if not text.strip():
-        raise RuntimeError(f"Whisper вернул пустой транскрипт для {file_path} (язык: {info.language})")
-    return text.strip()
+    """Транскрибирует файл локально через faster-whisper.
+
+    Запускается в ОТДЕЛЬНОМ ПРОЦЕССЕ, а не просто в текущем — на слабых
+    серверах память между последовательными вызовами Whisper освобождается
+    не полностью (похоже на утечку на уровне ctranslate2), и уже через
+    1-2 куска подряд процесс падает по нехватке памяти. Отдельный процесс
+    на каждый кусок гарантирует, что ОС вернёт всю память при его
+    завершении, независимо от утечек внутри библиотеки. Цена — модель
+    грузится заново на каждый кусок (обычно 1-3 сек, если веса уже
+    закешированы на диске)."""
+    ctx = mp.get_context("spawn")  # spawn безопаснее fork рядом с asyncio-циклом в родителе
+    queue = ctx.Queue()
+    process = ctx.Process(
+        target=_whisper_subprocess_worker,
+        args=(file_path, WHISPER_MODEL_SIZE, queue),
+    )
+    process.start()
+    process.join(timeout=WHISPER_SUBPROCESS_TIMEOUT)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise TimeoutError(
+            f"Распознавание не уложилось в {WHISPER_SUBPROCESS_TIMEOUT} сек "
+            f"для {file_path} — процесс принудительно остановлен"
+        )
+
+    if process.exitcode != 0:
+        raise RuntimeError(
+            f"Процесс распознавания упал (код выхода {process.exitcode}) при "
+            f"обработке {file_path} — похоже на нехватку памяти на сервере"
+        )
+
+    if queue.empty():
+        raise RuntimeError(f"Процесс распознавания завершился без результата для {file_path}")
+
+    status, payload = queue.get()
+    if status == "error":
+        raise RuntimeError(f"Ошибка распознавания в дочернем процессе: {payload}")
+    if not payload.strip():
+        raise RuntimeError(f"Whisper вернул пустой транскрипт для {file_path}")
+    return payload.strip()
 
 
 def _transcribe_file_sync(file_path: str) -> str:

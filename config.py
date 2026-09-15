@@ -38,6 +38,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # tiny, base, small, medium, large-v3. "base" — разумный баланс для CPU-сервера.
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 
+# Максимальное время (в секундах) на распознавание ОДНОГО куска аудио в
+# отдельном процессе, прежде чем считать его зависшим и принудительно
+# остановить. Кусок — это CHUNK_SECONDS (10 минут) аудио или меньше.
+WHISPER_SUBPROCESS_TIMEOUT = int(os.getenv("WHISPER_SUBPROCESS_TIMEOUT", "900"))
+
 # --- Threads (Meta Graph API) — пока НЕ используется, публикация ручная.
 #     Переменные оставлены на случай, если решишь включить автопубликацию
 #     позже (см. threads_api.py, scheduler.py и README). ---
