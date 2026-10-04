@@ -11,4 +11,4 @@ openai>=1.12
 requests>=2.31
 python-dotenv>=1.0
 # apscheduler>=3.10  # понадобится, если включишь автопубликацию (scheduler.py)
-deno>=2.0  # JavaScript-движок, нужен yt-dlp для YouTube
+deno>=2.0
