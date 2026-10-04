@@ -83,3 +83,18 @@ def validate():
             f"Не заданы переменные окружения: {', '.join(missing)}. "
             f"Проверь файл config.env (см. config.env.example)."
         )
+
+
+# --- YouTube cookies из переменной COOKIES_B64 (добавлено patch_cookies.py) ---
+# Содержимое cookies.txt в base64. При запуске разворачивается в файл, который
+# потом использует downloader.py. Так cookies не попадают в git.
+_COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
+if _COOKIES_B64:
+    import base64 as _b64
+    _cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    try:
+        with open(_cookies_path, "wb") as _f:
+            _f.write(_b64.b64decode(_COOKIES_B64))
+        COOKIES_FILE = _cookies_path
+    except Exception as _e:
+        print(f"ВНИМАНИЕ: не удалось раскодировать COOKIES_B64: {_e}")

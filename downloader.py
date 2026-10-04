@@ -1,18 +1,12 @@
 """
-Скачивание аудиодорожки из YouTube-видео через yt-dlp.
+Скачивание аудиодорожки из видео (YouTube, Instagram Reels, TikTok и др.) через yt-dlp.
+Та же проверенная версия, что в коннекторе whisper-mcp-connector.
 
-ffmpeg не ставится через apt на всех хостингах (например, Bothost без
-Docker его не даёт), поэтому используем imageio-ffmpeg — pip-пакет,
-внутри которого уже лежит готовый статический бинарник ffmpeg. Ничего
-скачивать при старте не нужно, работает сразу после pip install.
-
-YouTube в 2026 году постоянно меняет протокол стриминга и то, какие
-"клиенты" (player_client) у yt-dlp работают, а какие внезапно ломаются —
-это открытая гонка между YouTube и разработчиками yt-dlp, конкретный
-рабочий вариант держится неделями, а не годами. Поэтому вместо одного
-жёстко зашитого клиента перебираем НЕСКОЛЬКО вариантов по очереди: если
-один сломался из-за очередного изменения на стороне YouTube, код сам
-попробует следующий, не падая сразу в ошибку.
+Для YouTube:
+  - нужен JavaScript-движок Deno (пакет deno в requirements.txt) — без него
+    YouTube почти не отдаёт форматы, особенно при входе через cookies;
+  - cookies передаются переменной COOKIES_B64 (см. config.py);
+  - перебираются несколько "клиентов" плеера, первым — стандартный выбор yt-dlp.
 """
 import os
 import logging
@@ -27,19 +21,19 @@ logger = logging.getLogger(__name__)
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 # Порядок важен: пробуем от "скорее всего рабочего сейчас" к запасным.
-# Если YouTube в очередной раз что-то сломает — правь этот список первым,
-# не обязательно переписывать всю логику. None в конце — не подменяем
-# клиента вообще, пусть yt-dlp сам решает (иногда это надёжнее любого
-# конкретного клиента, если YouTube сломал именно наши явные варианты).
+# None в конце — не подменяем клиента вообще, пусть yt-dlp сам решает.
 PLAYER_CLIENT_FALLBACKS = [
-    ["default", "web_embedded"],
+    None,  # стандартный выбор yt-dlp — с Deno это лучший вариант
     ["tv", "web_safari"],
     ["ios"],
     ["android"],
     ["mweb"],
     ["web_safari"],
-    None,
 ]
+
+
+def _cookies_active() -> bool:
+    return bool(COOKIES_FILE and os.path.exists(COOKIES_FILE))
 
 
 def _build_ydl_opts(out_dir: str, player_clients: list[str] | None) -> dict:
@@ -59,13 +53,15 @@ def _build_ydl_opts(out_dir: str, player_clients: list[str] | None) -> dict:
     if player_clients is not None:
         ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
 
-    # Запасной путь: если задан файл с cookies (экспортированными из браузера) —
-    # используем его. НЕ смешиваем cookies с клиентом "tv" — это может
-    # инвалидировать сессию в самом браузере, откуда куки экспортированы.
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+    if _cookies_active():
         ydl_opts["cookiefile"] = COOKIES_FILE
-        safe_clients = [c for c in (player_clients or []) if c != "tv"] or ["web_safari"]
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": safe_clients}}
+        # Клиент "tv" с cookies не смешиваем — может оборвать сессию аккаунта.
+        if player_clients is not None:
+            safe_clients = [c for c in player_clients if c != "tv"]
+            if safe_clients:
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": safe_clients}}
+            else:
+                ydl_opts.pop("extractor_args", None)
     return ydl_opts
 
 
@@ -76,12 +72,10 @@ def _is_youtube(url: str) -> bool:
 def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
     os.makedirs(out_dir, exist_ok=True)
 
-    # Перебор player_client имеет смысл только для YouTube — это его
-    # специфика. Для Instagram/TikTok пробуем один раз, иначе одна и та же
-    # ошибка просто повторится четыре раза подряд.
     client_variants = PLAYER_CLIENT_FALLBACKS if _is_youtube(url) else [PLAYER_CLIENT_FALLBACKS[0]]
 
     last_error = None
+    cookies_used = _cookies_active()
     for i, player_clients in enumerate(client_variants, start=1):
         ydl_opts = _build_ydl_opts(out_dir, player_clients)
         try:
@@ -93,14 +87,14 @@ def _download_sync(url: str, out_dir: str) -> tuple[str, str]:
                 if i > 1:
                     logger.info(
                         f"Скачано успешно с {i}-й попытки, "
-                        f"player_client={player_clients}"
+                        f"player_client={player_clients}, cookies={cookies_used}"
                     )
                 return audio_path, title
         except yt_dlp.utils.DownloadError as e:
             last_error = e
             logger.warning(
                 f"Не удалось скачать (попытка {i}/{len(client_variants)}, "
-                f"player_client={player_clients}): {e}"
+                f"player_client={player_clients}, cookies={cookies_used}): {e}"
             )
             continue
 

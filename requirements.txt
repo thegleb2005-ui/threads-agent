@@ -4,10 +4,11 @@ aiosqlite>=0.19
 # YouTube — если скачивание вдруг перестанет работать с ошибками вида
 # "Sign in to confirm you're not a bot" или подобными, первым делом
 # попробуй просто поднять версию здесь до самой свежей.
-yt-dlp>=2026.1.1
+yt-dlp[default]>=2026.8.19
 imageio-ffmpeg>=0.5
 faster-whisper>=1.0
 openai>=1.12
 requests>=2.31
 python-dotenv>=1.0
 # apscheduler>=3.10  # понадобится, если включишь автопубликацию (scheduler.py)
+deno>=2.0  # JavaScript-движок, нужен yt-dlp для YouTube
