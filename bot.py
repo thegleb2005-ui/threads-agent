@@ -29,6 +29,8 @@ import downloader
 from db import init_db, recover_stuck_posts, add_post, update_post, get_post, get_posts_by_status
 from worker import process_queue_forever
 
+BOT_VERSION = "2026-10-04 расшифровка на русском + устойчивость к памяти"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -339,6 +341,13 @@ async def main():
     cookies_status = "используются" if downloader._cookies_active() else "НЕ используются"
 
     asyncio.create_task(process_queue_forever(bot, config.ADMIN_USER_ID))
+    import transcriber as _tr
+    logger.info(
+        f"ВЕРСИЯ БОТА: {BOT_VERSION} | Whisper: модель={config.WHISPER_MODEL_SIZE}, "
+        f"beam={config.WHISPER_BEAM_SIZE}, ядер={config.WHISPER_CPU_THREADS}, "
+        f"кусок={_tr.CHUNK_SECONDS}с | YouTube по умолчанию: "
+        f"{'расшифровка' if config.YOUTUBE_DEFAULT_TRANSCRIPT else 'спрашивать'}"
+    )
     logger.info(
         f"Бот запущен, жду сообщений... "
         f"(TRANSCRIBE_PROVIDER={config.TRANSCRIBE_PROVIDER!r}, KIE_MODEL={config.KIE_MODEL!r}, "

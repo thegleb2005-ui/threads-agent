@@ -336,21 +336,37 @@ def _transcribe_local_once(file_path: str, model_size: str) -> str:
     return payload.strip()
 
 
+OOM_RETRY_PAUSE_SECONDS = 20
+
+
 def _transcribe_via_local_whisper(file_path: str) -> str:
-    """Локальный Whisper с автопонижением модели при нехватке памяти."""
+    """Локальный Whisper, устойчивый к нехватке памяти:
+      1) не хватило памяти — ждём и повторяем тем же размером модели (память
+         могла быть временно занята другим ботом на тарифе, например коннектором);
+      2) снова не хватило — берём модель меньше и повторяем тот же кусок;
+      3) так до самой маленькой (tiny). Видео любой длины режется на куски,
+         поэтому длина на память не влияет — только на время."""
     global _effective_model
+    retried_same_model = False
     while True:
         try:
             return _transcribe_local_once(file_path, _effective_model)
         except OutOfMemory as e:
+            if not retried_same_model:
+                retried_same_model = True
+                logger.warning(f"Модели '{_effective_model}' не хватило памяти ({e}) — "
+                               f"жду {OOM_RETRY_PAUSE_SECONDS} сек и повторяю кусок")
+                time.sleep(OOM_RETRY_PAUSE_SECONDS)
+                continue
             idx = MODEL_LADDER.index(_effective_model)
             if idx + 1 >= len(MODEL_LADDER):
                 raise RuntimeError(f"Не хватает памяти даже для модели tiny ({e}). "
                                    f"Остановите другие боты на тарифе или увеличьте тариф.")
             smaller = MODEL_LADDER[idx + 1]
-            logger.warning(f"Модель '{_effective_model}' не поместилась в память ({e}) — "
+            logger.warning(f"Модель '{_effective_model}' снова не поместилась ({e}) — "
                            f"переключаюсь на '{smaller}' и повторяю кусок")
             _effective_model = smaller
+            retried_same_model = False
 
 
 def _transcribe_file_sync(file_path: str) -> str:
