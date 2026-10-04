@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS posts (
     status_chat_id INTEGER,
     status_message_id INTEGER,
     mode TEXT DEFAULT 'post',
+    user_id INTEGER,
+    user_name TEXT,
+    transcript_source TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     published_at TEXT
@@ -49,7 +52,14 @@ MIGRATIONS = [
     ("status_message_id", "ALTER TABLE posts ADD COLUMN status_message_id INTEGER"),
     # Режим обработки: 'post' — черновик поста, 'transcript' — расшифровка на русском
     ("mode", "ALTER TABLE posts ADD COLUMN mode TEXT DEFAULT 'post'"),
+    # Многопользовательский режим: чьё это видео
+    ("user_id", "ALTER TABLE posts ADD COLUMN user_id INTEGER"),
+    ("user_name", "ALTER TABLE posts ADD COLUMN user_name TEXT"),
+    # Откуда текст: 'subtitles' (субтитры YouTube) или 'whisper' (распознавание)
+    ("transcript_source", "ALTER TABLE posts ADD COLUMN transcript_source TEXT"),
 ]
+
+ACTIVE_STATUSES = ("queued", "downloading", "transcribing", "generating")
 
 
 def _now() -> str:
@@ -67,13 +77,13 @@ async def init_db():
         await db.commit()
 
 
-async def add_post(source_url: str) -> int:
+async def add_post(source_url: str, user_id: int | None = None, user_name: str = "") -> int:
     now = _now()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO posts (source_url, status, created_at, updated_at) "
-            "VALUES (?, 'awaiting_prompt', ?, ?)",
-            (source_url, now, now),
+            "INSERT INTO posts (source_url, status, user_id, user_name, created_at, updated_at) "
+            "VALUES (?, 'awaiting_prompt', ?, ?, ?, ?)",
+            (source_url, user_id, user_name, now, now),
         )
         await db.commit()
         return cursor.lastrowid
@@ -135,3 +145,63 @@ async def get_next_queued():
 async def get_oldest_approved():
     rows = await get_posts_by_status("approved", limit=1)
     return rows[0] if rows else None
+
+
+async def get_all_queued():
+    """Все ожидающие обработки, старые первыми."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM posts WHERE status = 'queued' ORDER BY created_at ASC")
+        return await cursor.fetchall()
+
+
+def _today_start() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+
+
+async def count_user_posts_today(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM posts WHERE user_id = ? AND created_at >= ?", (user_id, _today_start()))
+        return (await cursor.fetchone())[0]
+
+
+async def count_user_active(user_id: int) -> int:
+    placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM posts WHERE user_id = ? AND status IN ({placeholders})",
+            (user_id, *ACTIVE_STATUSES))
+        return (await cursor.fetchone())[0]
+
+
+async def get_user_posts(user_id: int | None, statuses: tuple, limit: int = 20):
+    """Видео пользователя в указанных статусах (user_id=None — всех пользователей)."""
+    placeholders = ",".join("?" for _ in statuses)
+    where, args = f"status IN ({placeholders})", list(statuses)
+    if user_id is not None:
+        where += " AND user_id = ?"
+        args.append(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT * FROM posts WHERE {where} ORDER BY created_at ASC LIMIT ?", (*args, limit))
+        return await cursor.fetchall()
+
+
+async def get_stats() -> dict:
+    today = _today_start()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async def one(sql, *a):
+            return (await (await db.execute(sql, a)).fetchone())[0]
+        return {
+            "users_total": await one("SELECT COUNT(DISTINCT user_id) FROM posts WHERE user_id IS NOT NULL"),
+            "users_today": await one("SELECT COUNT(DISTINCT user_id) FROM posts WHERE created_at >= ?", today),
+            "videos_today": await one("SELECT COUNT(*) FROM posts WHERE created_at >= ?", today),
+            "errors_today": await one("SELECT COUNT(*) FROM posts WHERE status = 'error' AND created_at >= ?", today),
+            "subtitles_today": await one(
+                "SELECT COUNT(*) FROM posts WHERE transcript_source = 'subtitles' AND created_at >= ?", today),
+            "in_queue": await one("SELECT COUNT(*) FROM posts WHERE status = 'queued'"),
+            "in_work": await one(
+                "SELECT COUNT(*) FROM posts WHERE status IN ('downloading','transcribing','generating')"),
+        }

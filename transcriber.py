@@ -435,3 +435,27 @@ async def transcribe_audio(file_path: str) -> str:
     """Распознаёт речь в mp3-файле. Возвращает распознанный текст."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _transcribe_sync, file_path)
+
+
+# --- Покусочный интерфейс для честной очереди --------------------------------
+# Воркер сам решает, чей кусок распознавать следующим, поэтому ему нужно
+# разрезать файл заранее и распознавать куски по одному.
+
+def _split_for_whisper_sync(file_path: str):
+    duration = _get_duration_seconds(file_path)
+    if duration <= CHUNK_SECONDS:
+        return None, [file_path], duration
+    tmp_dir = tempfile.mkdtemp(prefix="chunks_")
+    return tmp_dir, _split_audio(file_path, tmp_dir), duration
+
+
+async def split_for_whisper(file_path: str):
+    """Возвращает (временная папка или None, список кусков, длительность в секундах)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _split_for_whisper_sync, file_path)
+
+
+async def transcribe_chunk(chunk_path: str) -> str:
+    """Распознаёт один кусок (с защитой от нехватки памяти)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _transcribe_file_sync, chunk_path)

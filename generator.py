@@ -140,3 +140,47 @@ def _translate_sync(text: str) -> str:
 async def translate_to_russian(text: str) -> str:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _translate_sync, text)
+
+
+# --- Выжимка о сути видео ----------------------------------------------------
+SUMMARY_SINGLE_CALL_CHARS = 40000   # до такой длины — одним запросом
+SUMMARY_PART_CHARS = 30000          # длиннее — по частям, потом общая выжимка
+
+SUMMARY_SYSTEM_PROMPT = (
+    "Ты делаешь выжимку видео по его расшифровке. Пиши на русском языке, простым "
+    "текстом без Markdown (без звёздочек, решёток и жирного шрифта). Формат:\n"
+    "Суть: 2-3 предложения о главной мысли видео.\n\n"
+    "Ключевые мысли:\n• ...\n• ...\n(от 4 до 8 пунктов, каждый — одно ёмкое предложение)\n\n"
+    "Если в видео есть конкретные советы, цифры или выводы — обязательно сохрани их. "
+    "Не выдумывай того, чего нет в расшифровке. Уложись в 2500 символов."
+)
+
+PARTIAL_SUMMARY_PROMPT = (
+    "Кратко перескажи этот фрагмент расшифровки видео на русском языке: главные мысли, "
+    "советы, цифры и выводы, 5-10 пунктов. Без вступлений, без Markdown."
+)
+
+
+def _ask(system: str, user: str, max_tokens: int = 2000) -> str:
+    response = _client.chat.completions.create(
+        model=KIE_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.3,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _summarize_sync(text: str) -> str:
+    if len(text) <= SUMMARY_SINGLE_CALL_CHARS:
+        return _ask(SUMMARY_SYSTEM_PROMPT, text)
+    # Очень длинное видео: сначала конспект каждой части, потом общая выжимка.
+    parts = _split_for_translation(text, SUMMARY_PART_CHARS)
+    notes = [_ask(PARTIAL_SUMMARY_PROMPT, part, 1500) for part in parts]
+    joined = "\n\n".join(f"Часть {i}:\n{n}" for i, n in enumerate(notes, 1))
+    return _ask(SUMMARY_SYSTEM_PROMPT, "Это конспекты частей одного видео по порядку:\n\n" + joined)
+
+
+async def summarize_ru(text: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _summarize_sync, text)

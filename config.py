@@ -55,6 +55,27 @@ WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "300"))
 # Пост вместо расшифровки можно выбрать кнопкой.
 YOUTUBE_DEFAULT_TRANSCRIPT = os.getenv("YOUTUBE_DEFAULT_TRANSCRIPT", "true").lower() in ("1", "true", "yes", "да")
 
+# Для Instagram Reels сразу делать пост по этому промпту (true/false).
+# Свой промпт можно прислать текстом в любой момент после ссылки.
+INSTAGRAM_DEFAULT_POST = os.getenv("INSTAGRAM_DEFAULT_POST", "true").lower() in ("1", "true", "yes", "да")
+INSTAGRAM_DEFAULT_PROMPT = os.getenv(
+    "INSTAGRAM_DEFAULT_PROMPT", "Сделай пост для тредс на английском языке по этому рилс"
+)
+
+# --- Доступ для всех пользователей ---
+# Пусто — бот открыт для всех. Иначе — только эти Telegram ID через запятую
+# (ты, ADMIN_USER_ID, имеешь доступ всегда).
+ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+# Сколько новых видео в сутки может прислать один человек (0 — без лимита).
+# Перевод, выжимка и посты идут с твоего ключа kie.ai, поэтому лимит — защита бюджета.
+DAILY_LIMIT_PER_USER = int(os.getenv("DAILY_LIMIT_PER_USER", "20"))
+# Сколько видео один человек может держать в очереди одновременно.
+MAX_QUEUED_PER_USER = int(os.getenv("MAX_QUEUED_PER_USER", "3"))
+# Сколько видео скачивать параллельно (скачивание — сеть, память почти не ест).
+MAX_PARALLEL_DOWNLOADS = int(os.getenv("MAX_PARALLEL_DOWNLOADS", "2"))
+# Для YouTube сначала брать готовые субтитры, Whisper — только если их нет.
+USE_YOUTUBE_SUBTITLES = os.getenv("USE_YOUTUBE_SUBTITLES", "true").lower() in ("1", "true", "yes", "да")
+
 # --- Threads (Meta Graph API) — пока НЕ используется, публикация ручная.
 #     Переменные оставлены на случай, если решишь включить автопубликацию
 #     позже (см. threads_api.py, scheduler.py и README). ---

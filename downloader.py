@@ -105,3 +105,96 @@ async def download_audio(url: str) -> tuple[str, str]:
     """Скачивает аудио по ссылке на видео. Возвращает (путь_к_файлу, название)."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _download_sync, url, DOWNLOADS_DIR)
+
+
+# --- Субтитры YouTube ---------------------------------------------------------
+# Если у видео есть субтитры, текст берём из них — это секунды вместо минут
+# распознавания. Берём только ОРИГИНАЛЬНЫЕ субтитры (ручные или автоматические
+# на языке видео), а не автоперевод YouTube — он хуже нашего перевода.
+import re as _re
+import json as _json
+
+SUBTITLE_FORMATS = ("json3", "vtt")
+MIN_SUBTITLE_CHARS = 40
+MIN_CHARS_PER_MINUTE = 150   # меньше — субтитры неполные, лучше распознать звук
+
+
+def _pick_subtitle_track(info: dict):
+    """Возвращает (список форматов дорожки, описание) или None."""
+    lang = (info.get("language") or "").split("-")[0].lower()
+    manual = {k: v for k, v in (info.get("subtitles") or {}).items() if k != "live_chat" and v}
+    auto = {k: v for k, v in (info.get("automatic_captions") or {}).items() if v}
+
+    for key in [k for k in (lang, f"{lang}-orig") if k] + ["ru", "en"]:
+        if key in manual:
+            return manual[key], f"субтитры автора ({key})"
+    if manual:
+        key = next(iter(manual))
+        return manual[key], f"субтитры автора ({key})"
+
+    # Автосубтитры: среди них десятки автопереводов. Оригинал помечен "-orig";
+    # если такой пометки нет — берём только язык видео, если он известен.
+    orig = [k for k in auto if k.endswith("-orig")]
+    if orig:
+        return auto[orig[0]], f"автосубтитры ({orig[0].replace('-orig', '')})"
+    if lang and lang in auto:
+        return auto[lang], f"автосубтитры ({lang})"
+    return None
+
+
+def _subtitle_text(raw: str, ext: str) -> str:
+    if ext == "json3":
+        data = _json.loads(raw)
+        text = "".join(seg.get("utf8", "") for ev in data.get("events", []) for seg in ev.get("segs", []) or [])
+    else:  # vtt: убираем служебное и повторяющиеся строки автосубтитров
+        lines, prev = [], None
+        for line in raw.splitlines():
+            line = _re.sub(r"<[^>]+>", "", line).strip()
+            if not line or "-->" in line or line.startswith(("WEBVTT", "Kind:", "Language:")) or line.isdigit():
+                continue
+            if line != prev:
+                lines.append(line)
+            prev = line
+        text = " ".join(lines)
+    text = _re.sub(r"\[[^\]]{1,30}\]", " ", text)   # [Music], [Музыка], [Applause]
+    return _re.sub(r"\s+", " ", text).strip()
+
+
+def _fetch_subtitles_sync(url: str):
+    """Возвращает (название, текст, описание источника) или None."""
+    for player_clients in PLAYER_CLIENT_FALLBACKS[:3]:
+        opts = _build_ydl_opts(DOWNLOADS_DIR, player_clients)
+        opts.pop("postprocessors", None)
+        opts["skip_download"] = True
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                track = _pick_subtitle_track(info)
+                if not track:
+                    logger.info("Субтитров у видео нет — нужно распознавание")
+                    return None
+                formats, label = track
+                fmt = next((f for ext in SUBTITLE_FORMATS for f in formats if f.get("ext") == ext), None)
+                if not fmt:
+                    return None
+                raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", "replace")
+                text = _subtitle_text(raw, fmt["ext"])
+                duration_min = (info.get("duration") or 0) / 60
+                if len(text) < MIN_SUBTITLE_CHARS or (
+                        duration_min > 1 and len(text) / duration_min < MIN_CHARS_PER_MINUTE):
+                    logger.info(f"Субтитры слишком короткие ({len(text)} симв.) — будет распознавание")
+                    return None
+                logger.info(f"Взял {label}: {len(text)} символов")
+                return info.get("title") or info.get("id"), text, label
+        except Exception as e:
+            logger.warning(f"Не удалось получить субтитры (player_client={player_clients}): {e}")
+            continue
+    return None
+
+
+async def fetch_subtitles(url: str):
+    """(название, текст, источник) из субтитров YouTube или None, если их нет."""
+    if not _is_youtube(url):
+        return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch_subtitles_sync, url)
