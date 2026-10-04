@@ -25,6 +25,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
+import downloader
 from db import init_db, recover_stuck_posts, add_post, update_post, get_post, get_posts_by_status
 from worker import process_queue_forever
 
@@ -62,10 +63,25 @@ class EditState(StatesGroup):
 
 def _prompt_choice_keyboard(post_id: int):
     kb = InlineKeyboardBuilder()
+    kb.button(text="📝 Расшифровка на русском", callback_data=f"transcript:{post_id}")
     kb.button(text="📋 Базовый промпт", callback_data=f"baseprompt:{post_id}")
     kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
-    kb.adjust(2)
+    kb.adjust(1, 2)
     return kb.as_markup()
+
+
+def _youtube_default_keyboard(post_id: int):
+    """Для YouTube расшифровка уже запущена — кнопки, чтобы вместо неё сделать пост."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Пост по базовому промпту", callback_data=f"baseprompt:{post_id}")
+    kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
+    kb.adjust(1, 1)
+    return kb.as_markup()
+
+
+def _is_youtube(url: str) -> bool:
+    u = url.lower()
+    return "youtube.com" in u or "youtu.be" in u
 
 
 def _draft_keyboard(post_id: int):
@@ -81,17 +97,41 @@ def _is_admin(user_id: int) -> bool:
     return user_id == config.ADMIN_USER_ID
 
 
-async def _start_processing(post_id: int, chat_id: int, custom_prompt: str | None):
-    """Переводит пост в очередь на обработку и создаёт статусное сообщение,
-    которое воркер потом будет редактировать по ходу работы."""
-    status_msg = await bot.send_message(chat_id, f"⏳ Пост #{post_id} поставлен в очередь...")
+async def _start_processing(post_id: int, chat_id: int, custom_prompt: str | None, mode: str = "post"):
+    """Переводит видео в очередь и создаёт статусное сообщение, которое воркер
+    потом редактирует по ходу работы."""
+    status_msg = await bot.send_message(chat_id, f"⏳ Видео #{post_id} поставлено в очередь...")
     await update_post(
         post_id,
         status="queued",
+        mode=mode,
         custom_prompt=custom_prompt,
         status_chat_id=chat_id,
         status_message_id=status_msg.message_id,
     )
+
+
+async def _apply_choice(post_id: int, chat_id: int, mode: str, custom_prompt: str | None) -> str:
+    """Применяет выбор (расшифровка / пост) в любой момент жизни видео:
+      - ещё не запускали — запускаем;
+      - качается или распознаётся — меняем режим, воркер учтёт его в конце;
+      - уже готово (или упало) — запускаем заново; если расшифровка уже есть,
+        повторно ничего не качаем и не распознаём.
+    Возвращает короткий текст для пользователя."""
+    post = await get_post(post_id)
+    if post is None:
+        return "Видео не найдено."
+    st = post["status"]
+    if st == "awaiting_prompt":
+        await _start_processing(post_id, chat_id, custom_prompt, mode)
+        return "Запускаю обработку."
+    if st in ("queued", "downloading", "transcribing"):
+        await update_post(post_id, mode=mode, custom_prompt=custom_prompt)
+        return "Ок, учту это, как только закончится распознавание."
+    if st == "generating":
+        return "Сейчас идёт последний шаг — дождись результата и нажми кнопку ещё раз."
+    await _start_processing(post_id, chat_id, custom_prompt, mode)
+    return "Запускаю заново." + (" Расшифровка уже есть — будет быстро." if post["transcript"] else "")
 
 
 @dp.message(CommandStart())
@@ -99,10 +139,11 @@ async def cmd_start(message: Message):
     if not _is_admin(message.from_user.id):
         return
     await message.answer(
-        "Привет! Кидай ссылку на видео (YouTube, Instagram Reels, TikTok) — "
-        "спрошу, каким промптом его обработать.\n\n"
-        "Можно ответить своим текстом (индивидуальная инструкция для ИИ) "
-        "или нажать кнопку базового промпта.\n\n"
+        "Привет! Кидай ссылку на видео (YouTube, Instagram Reels, TikTok).\n\n"
+        "• Для YouTube сразу делаю расшифровку на русском. Если нужен пост — "
+        "нажми кнопку или напиши свой промпт.\n"
+        "• Для остальных ссылок спрошу: расшифровка, пост по базовому промпту "
+        "или твой промпт текстом.\n\n"
         "Команды:\n"
         "/queue — что сейчас в обработке\n"
         "/pending — черновики, ожидающие решения"
@@ -117,16 +158,24 @@ async def handle_link(message: Message, state: FSMContext):
     url = match.group(0)
     post_id = await add_post(url)
 
+    # Свой промпт можно прислать текстом в любой момент после ссылки.
     await state.update_data(pending_post_id=post_id)
     await state.set_state(PromptState.waiting_for_custom_prompt)
 
+    if config.YOUTUBE_DEFAULT_TRANSCRIPT and _is_youtube(url):
+        await message.answer(
+            f"🔗 Ссылка принята (#{post_id}). Делаю расшифровку на русском.\n\n"
+            f"Если нужен пост — нажми кнопку или просто напиши свой промпт.",
+            reply_markup=_youtube_default_keyboard(post_id),
+        )
+        await _start_processing(post_id, message.chat.id, None, mode="transcript")
+        return
+
     await message.answer(
         f"🔗 Ссылка принята (#{post_id}).\n\n"
-        f"Напиши, что сделать с этим видео — например:\n"
-        f"• «переведи текст дословно, ничего не меняя»\n"
+        f"Выбери, что сделать, или напиши свой промпт, например:\n"
         f"• «сделай пост в 3 предложения, дерзкий тон»\n"
-        f"• «оставь как есть, только разбей на абзацы»\n\n"
-        f"Или жми кнопку, чтобы использовать базовый промпт.",
+        f"• «оставь как есть, только разбей на абзацы»",
         reply_markup=_prompt_choice_keyboard(post_id),
     )
 
@@ -143,8 +192,19 @@ async def handle_custom_prompt(message: Message, state: FSMContext):
 
     custom_prompt = message.text.strip()
     await state.clear()
-    await message.answer("🎯 Принял индивидуальный промпт, начинаю обработку.")
-    await _start_processing(post_id, message.chat.id, custom_prompt)
+    result = await _apply_choice(post_id, message.chat.id, "post", custom_prompt)
+    await message.answer(f"🎯 Принял свой промпт для #{post_id}. {result}")
+
+
+async def _mark_choice(callback: CallbackQuery, note: str):
+    """Дописывает выбор к сообщению с кнопками и убирает кнопки."""
+    try:
+        if callback.message.text:
+            await callback.message.edit_text(callback.message.text + f"\n\n{note}")
+        else:  # сообщение с файлом — меняем только кнопки
+            await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data.startswith("baseprompt:"))
@@ -153,10 +213,30 @@ async def cb_base_prompt(callback: CallbackQuery, state: FSMContext):
         return
     post_id = int(callback.data.split(":")[1])
     await state.clear()
-    await callback.message.edit_text(
-        callback.message.text + "\n\n📋 Использую базовый промпт."
-    )
-    await _start_processing(post_id, callback.message.chat.id, None)
+    result = await _apply_choice(post_id, callback.message.chat.id, "post", None)
+    await _mark_choice(callback, f"📋 Пост по базовому промпту. {result}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("transcript:"))
+async def cb_transcript(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        return
+    post_id = int(callback.data.split(":")[1])
+    await state.clear()
+    result = await _apply_choice(post_id, callback.message.chat.id, "transcript", None)
+    await _mark_choice(callback, f"📝 Расшифровка на русском. {result}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("customprompt:"))
+async def cb_custom_prompt(callback: CallbackQuery, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        return
+    post_id = int(callback.data.split(":")[1])
+    await state.update_data(pending_post_id=post_id)
+    await state.set_state(PromptState.waiting_for_custom_prompt)
+    await callback.message.answer(f"✍️ Напиши промпт для поста по видео #{post_id}:")
     await callback.answer()
 
 
@@ -251,10 +331,13 @@ async def main():
     if recovered:
         logger.warning(f"Восстановлено {recovered} зависших поста(ов) после предыдущего сбоя")
 
+    cookies_status = "используются" if downloader._cookies_active() else "НЕ используются"
+
     asyncio.create_task(process_queue_forever(bot, config.ADMIN_USER_ID))
     logger.info(
         f"Бот запущен, жду сообщений... "
-        f"(TRANSCRIBE_PROVIDER={config.TRANSCRIBE_PROVIDER!r}, KIE_MODEL={config.KIE_MODEL!r})"
+        f"(TRANSCRIBE_PROVIDER={config.TRANSCRIBE_PROVIDER!r}, KIE_MODEL={config.KIE_MODEL!r}, "
+        f"COOKIES_FILE={config.COOKIES_FILE!r}, cookies {cookies_status})"
     )
 
     if recovered:

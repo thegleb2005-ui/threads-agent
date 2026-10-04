@@ -81,3 +81,62 @@ async def generate_draft(transcript: str, custom_prompt: str | None = None) -> s
     иначе базовая задача из BASE_SYSTEM_PROMPT."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _generate_sync, transcript, custom_prompt)
+
+
+# --- Расшифровка на русском --------------------------------------------------
+# Whisper сам переводит только на английский, поэтому для видео на других
+# языках переводим текст языковой моделью. Длинный текст режем на части,
+# иначе модель обрежет ответ по лимиту длины.
+
+TRANSLATE_CHUNK_CHARS = 6000
+
+TRANSLATE_SYSTEM_PROMPT = (
+    "You are a professional translator. Translate the user's text into natural, "
+    "fluent Russian. Keep the full meaning and all details — do NOT summarize, "
+    "shorten or add anything. Fix obvious speech-recognition errors only when the "
+    "meaning is clear from context. Split the result into readable paragraphs. "
+    "Output only the Russian translation."
+)
+
+
+def is_mostly_russian(text: str) -> bool:
+    """True, если в тексте преобладает кириллица — тогда перевод не нужен."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    cyr = sum(1 for c in letters if "а" <= c.lower() <= "я" or c.lower() == "ё")
+    return cyr / len(letters) > 0.6
+
+
+def _split_for_translation(text: str, limit: int = TRANSLATE_CHUNK_CHARS) -> list[str]:
+    parts, current = [], ""
+    for sentence in text.replace("\n", " ").split(". "):
+        piece = sentence if sentence.endswith(".") else sentence + "."
+        if current and len(current) + len(piece) + 1 > limit:
+            parts.append(current.strip())
+            current = ""
+        current += " " + piece
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def _translate_sync(text: str) -> str:
+    out = []
+    for part in _split_for_translation(text):
+        response = _client.chat.completions.create(
+            model=KIE_MODEL,
+            messages=[
+                {"role": "system", "content": TRANSLATE_SYSTEM_PROMPT},
+                {"role": "user", "content": part},
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+        )
+        out.append(response.choices[0].message.content.strip())
+    return "\n\n".join(out)
+
+
+async def translate_to_russian(text: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _translate_sync, text)

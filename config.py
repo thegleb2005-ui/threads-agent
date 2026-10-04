@@ -43,6 +43,18 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 # остановить. Кусок — это CHUNK_SECONDS (10 минут) аудио или меньше.
 WHISPER_SUBPROCESS_TIMEOUT = int(os.getenv("WHISPER_SUBPROCESS_TIMEOUT", "900"))
 
+# Экономия памяти: тариф с 1 ГБ делят этот бот и коннектор «мой».
+# beam_size=1 — "жадное" распознавание: в разы меньше памяти, качество почти то же.
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
+# Сколько ядер даёт Whisper. Меньше ядер — меньше буферов в памяти.
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))
+# Длина куска аудио, секунды. Короче кусок — меньше пик памяти.
+WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "300"))
+
+# Для ссылок на YouTube сразу делать расшифровку на русском (true/false).
+# Пост вместо расшифровки можно выбрать кнопкой.
+YOUTUBE_DEFAULT_TRANSCRIPT = os.getenv("YOUTUBE_DEFAULT_TRANSCRIPT", "true").lower() in ("1", "true", "yes", "да")
+
 # --- Threads (Meta Graph API) — пока НЕ используется, публикация ручная.
 #     Переменные оставлены на случай, если решишь включить автопубликацию
 #     позже (см. threads_api.py, scheduler.py и README). ---

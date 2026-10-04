@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS posts (
     error_message TEXT,
     status_chat_id INTEGER,
     status_message_id INTEGER,
+    mode TEXT DEFAULT 'post',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     published_at TEXT
@@ -46,6 +47,8 @@ MIGRATIONS = [
     ("custom_prompt", "ALTER TABLE posts ADD COLUMN custom_prompt TEXT"),
     ("status_chat_id", "ALTER TABLE posts ADD COLUMN status_chat_id INTEGER"),
     ("status_message_id", "ALTER TABLE posts ADD COLUMN status_message_id INTEGER"),
+    # Режим обработки: 'post' — черновик поста, 'transcript' — расшифровка на русском
+    ("mode", "ALTER TABLE posts ADD COLUMN mode TEXT DEFAULT 'post'"),
 ]
 
 

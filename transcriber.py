@@ -33,6 +33,7 @@ import requests
 from config import (
     KIE_API_KEY, TRANSCRIBE_PROVIDER, GEMINI_MODEL,
     WHISPER_MODEL_SIZE, WHISPER_SUBPROCESS_TIMEOUT,
+    WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS, WHISPER_CHUNK_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,21 @@ KIE_GEMINI_URL_TMPL = "https://api.kie.ai/{model}/v1/chat/completions"
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-CHUNK_SECONDS = 600  # 10 минут на кусок — с запасом от предполагаемого лимита kie.ai
+CHUNK_SECONDS = WHISPER_CHUNK_SECONDS  # по умолчанию 5 минут — меньше пик памяти
+
+# Модели от большой к маленькой. Если процесс убит за нехватку памяти,
+# берём следующую (меньшую) и повторяем тот же кусок.
+MODEL_LADDER = ["large-v3", "medium", "small", "base", "tiny"]
+# Модель, которая реально помещается в память; запоминается до перезапуска.
+_effective_model = WHISPER_MODEL_SIZE if WHISPER_MODEL_SIZE in MODEL_LADDER else "base"
+
+
+class OutOfMemory(RuntimeError):
+    pass
+
+
+def current_model() -> str:
+    return _effective_model
 
 POLL_INTERVAL_SECONDS = 5
 POLL_MAX_ATTEMPTS = 180  # до ~15 минут ожидания на один кусок
@@ -259,22 +274,24 @@ def _transcribe_via_gemini(file_path: str) -> str:
     raise last_error
 
 
-def _whisper_subprocess_worker(file_path: str, model_size: str, queue) -> None:
+def _whisper_subprocess_worker(file_path: str, model_size: str, queue,
+                               beam_size: int = 1, cpu_threads: int = 2) -> None:
     """Выполняется В ОТДЕЛЬНОМ ПРОЦЕССЕ (см. _transcribe_via_local_whisper).
     Загружает модель, распознаёт файл, кладёт результат в очередь и завершается.
     Не импортируем faster_whisper на уровне модуля — только здесь, внутри
     дочернего процесса, чтобы не тянуть лишнее в родительский процесс бота."""
     try:
         from faster_whisper import WhisperModel
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(file_path, beam_size=5)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8",
+                             cpu_threads=cpu_threads, num_workers=1)
+        segments, info = model.transcribe(file_path, beam_size=beam_size)
         text = " ".join(segment.text.strip() for segment in segments)
         queue.put(("ok", text))
     except Exception as e:
         queue.put(("error", f"{type(e).__name__}: {e}"))
 
 
-def _transcribe_via_local_whisper(file_path: str) -> str:
+def _transcribe_local_once(file_path: str, model_size: str) -> str:
     """Транскрибирует файл локально через faster-whisper.
 
     Запускается в ОТДЕЛЬНОМ ПРОЦЕССЕ, а не просто в текущем — на слабых
@@ -289,7 +306,7 @@ def _transcribe_via_local_whisper(file_path: str) -> str:
     queue = ctx.Queue()
     process = ctx.Process(
         target=_whisper_subprocess_worker,
-        args=(file_path, WHISPER_MODEL_SIZE, queue),
+        args=(file_path, model_size, queue, WHISPER_BEAM_SIZE, WHISPER_CPU_THREADS),
     )
     process.start()
     process.join(timeout=WHISPER_SUBPROCESS_TIMEOUT)
@@ -302,11 +319,11 @@ def _transcribe_via_local_whisper(file_path: str) -> str:
             f"для {file_path} — процесс принудительно остановлен"
         )
 
+    if process.exitcode is not None and process.exitcode < 0:
+        # -9 и другие отрицательные коды — процесс убит системой (обычно за память)
+        raise OutOfMemory(f"код выхода {process.exitcode}")
     if process.exitcode != 0:
-        raise RuntimeError(
-            f"Процесс распознавания упал (код выхода {process.exitcode}) при "
-            f"обработке {file_path} — похоже на нехватку памяти на сервере"
-        )
+        raise RuntimeError(f"Процесс распознавания упал (код выхода {process.exitcode}) при обработке {file_path}")
 
     if queue.empty():
         raise RuntimeError(f"Процесс распознавания завершился без результата для {file_path}")
@@ -317,6 +334,23 @@ def _transcribe_via_local_whisper(file_path: str) -> str:
     if not payload.strip():
         raise RuntimeError(f"Whisper вернул пустой транскрипт для {file_path}")
     return payload.strip()
+
+
+def _transcribe_via_local_whisper(file_path: str) -> str:
+    """Локальный Whisper с автопонижением модели при нехватке памяти."""
+    global _effective_model
+    while True:
+        try:
+            return _transcribe_local_once(file_path, _effective_model)
+        except OutOfMemory as e:
+            idx = MODEL_LADDER.index(_effective_model)
+            if idx + 1 >= len(MODEL_LADDER):
+                raise RuntimeError(f"Не хватает памяти даже для модели tiny ({e}). "
+                                   f"Остановите другие боты на тарифе или увеличьте тариф.")
+            smaller = MODEL_LADDER[idx + 1]
+            logger.warning(f"Модель '{_effective_model}' не поместилась в память ({e}) — "
+                           f"переключаюсь на '{smaller}' и повторяю кусок")
+            _effective_model = smaller
 
 
 def _transcribe_file_sync(file_path: str) -> str:
