@@ -71,11 +71,13 @@ def _prompt_choice_keyboard(post_id: int):
 
 
 def _youtube_default_keyboard(post_id: int):
-    """Для YouTube расшифровка уже запущена — кнопки, чтобы вместо неё сделать пост."""
+    """Для YouTube расшифровка запускается сама (выбрана по умолчанию), но все
+    кнопки видны: можно переключиться на пост или отменить."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Пост по базовому промпту", callback_data=f"baseprompt:{post_id}")
+    kb.button(text="✅ Расшифровка на русском (по умолчанию)", callback_data=f"transcript:{post_id}")
+    kb.button(text="📋 Базовый промпт", callback_data=f"baseprompt:{post_id}")
     kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
-    kb.adjust(1, 1)
+    kb.adjust(1, 2)
     return kb.as_markup()
 
 
@@ -126,6 +128,8 @@ async def _apply_choice(post_id: int, chat_id: int, mode: str, custom_prompt: st
         await _start_processing(post_id, chat_id, custom_prompt, mode)
         return "Запускаю обработку."
     if st in ("queued", "downloading", "transcribing"):
+        if (post["mode"] or "post") == mode and not custom_prompt:
+            return "Уже делаю."
         await update_post(post_id, mode=mode, custom_prompt=custom_prompt)
         return "Ок, учту это, как только закончится распознавание."
     if st == "generating":
@@ -164,8 +168,9 @@ async def handle_link(message: Message, state: FSMContext):
 
     if config.YOUTUBE_DEFAULT_TRANSCRIPT and _is_youtube(url):
         await message.answer(
-            f"🔗 Ссылка принята (#{post_id}). Делаю расшифровку на русском.\n\n"
-            f"Если нужен пост — нажми кнопку или просто напиши свой промпт.",
+            f"🔗 Ссылка принята (#{post_id}).\n\n"
+            f"Для YouTube по умолчанию делаю расшифровку на русском — уже запустил.\n"
+            f"Нужен пост — жми «Базовый промпт» или просто напиши свой промпт.",
             reply_markup=_youtube_default_keyboard(post_id),
         )
         await _start_processing(post_id, message.chat.id, None, mode="transcript")

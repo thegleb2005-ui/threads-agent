@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.pyc
 cookies.txt
+config.env
+.DS_Store
+env.example
+.env.example
