@@ -25,13 +25,14 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
-from db import get_all_queued, get_post, update_post
-from downloader import download_audio, fetch_subtitles
-from transcriber import split_for_whisper, transcribe_chunk, current_model
+from db import get_all_queued, get_post, update_post, get_media_cache, save_media_cache
+from downloader import (download_audio, fetch_subtitles, download_video_file,
+                        download_audio_file, extract_mp3, TooLargeError)
+from transcriber import split_for_whisper, transcribe_chunk, current_model, to_mp3
 from generator import generate_draft, translate_to_russian, is_mostly_russian, summarize_ru
 
 logger = logging.getLogger(__name__)
@@ -88,37 +89,66 @@ def _chat(post) -> int:
 
 # --- Клавиатуры и сообщения ---------------------------------------------------
 
+DOWNLOAD_MODES = ("video", "audio")
+
+ACTION_BUTTONS = [
+    ("transcript", "📝 Расшифровка на русском"),
+    ("social", "📱 Пост для соц сетей"),
+    ("video", "🎬 Скачать видео"),
+    ("audio", "🎵 Скачать звук (mp3)"),
+]
+
+
+def available_actions(source_url: str) -> list[str]:
+    """Какие действия имеют смысл для источника."""
+    if not source_url.startswith("tg:"):
+        return ["transcript", "social", "video", "audio"]
+    kind = source_url.split(":", 2)[1]
+    if kind in ("video", "video_note", "document"):
+        return ["transcript", "social", "audio"]   # видео у человека уже есть, а звук — пригодится
+    return ["transcript", "social"]                 # голосовые и аудио
+
+
+def choice_keyboard(post_id: int, source_url: str, exclude: tuple = (), with_cancel: bool = True):
+    kb = InlineKeyboardBuilder()
+    for action, label in ACTION_BUTTONS:
+        if action in available_actions(source_url) and action not in exclude:
+            data = {"video": "dlvideo", "audio": "dlaudio"}.get(action, action)
+            kb.button(text=label, callback_data=f"{data}:{post_id}")
+    if with_cancel:
+        kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def _draft_keyboard(post_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Готово", callback_data=f"done:{post_id}")
     kb.button(text="✏️ Редактировать", callback_data=f"edit:{post_id}")
     kb.button(text="🗑 Удалить", callback_data=f"reject:{post_id}")
-    kb.adjust(3)
+    kb.adjust(1)
     return kb.as_markup()
 
 
 def _transcript_keyboard(post_id: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Сделать пост", callback_data=f"baseprompt:{post_id}")
+    kb.button(text="📱 Пост для соц сетей", callback_data=f"social:{post_id}")
     kb.button(text="✍️ Пост со своим промптом", callback_data=f"customprompt:{post_id}")
-    kb.adjust(2)
+    kb.adjust(1)
     return kb.as_markup()
 
 
 def _render_progress(post_id: int, mode: str, stage: str, title: str = "",
-                     chunk: str = "", from_subtitles: bool = False, extra: str = "") -> str:
+                     percent: int | None = None, extra: str = "") -> str:
     order = ["downloading", "transcribing", "generating"]
     pos = order.index(stage) if stage in order else -1
     labels = {
-        "downloading": "Скачиваю видео",
-        "transcribing": "Распознаю речь" + (f" ({chunk})" if chunk else ""),
+        "downloading": "Загружаю видео",
+        "transcribing": "Распознаю речь" + (f" — {percent}%" if percent is not None else ""),
         "generating": FINAL_STEP_LABEL.get(mode, "Пишу пост"),
     }
     lines = [f"⏳ Обрабатываю видео #{post_id}", ""]
     for i, key in enumerate(order):
-        if key == "transcribing" and from_subtitles:
-            lines.append("📄 Текст взят из субтитров YouTube — распознавание не нужно")
-            continue
         mark = "✅" if i < pos else ("▶️" if i == pos else "⬜️")
         lines.append(f"{mark} {labels[key]}{'...' if i == pos else ''}")
     if title:
@@ -126,6 +156,9 @@ def _render_progress(post_id: int, mode: str, stage: str, title: str = "",
     if extra:
         lines.append(extra)
     return "\n".join(lines)
+
+
+BUSY_NOTE = "⏳ Сейчас много запросов — это может занять чуть больше времени."
 
 
 async def _edit_status(bot, post, text: str):
@@ -139,16 +172,9 @@ async def _edit_status(bot, post, text: str):
 
 
 async def _send_transcript(bot, chat_id: int, post_id: int, title: str, text: str,
-                           translated: bool, summary: str | None, from_subtitles: bool):
+                           translated: bool, summary: str | None):
     """Полный текст — файлом .txt, выжимка — отдельным сообщением с кнопками."""
-    caption = f"📄 Полная расшифровка #{post_id}"
-    notes = []
-    if from_subtitles:
-        notes.append("из субтитров YouTube")
-    if translated:
-        notes.append("переведено на русский")
-    if notes:
-        caption += f" ({', '.join(notes)})"
+    caption = f"📄 Полная расшифровка #{post_id}" + (" (переведено на русский)" if translated else "")
     if title:
         caption += f"\n🎬 {title}"
     await bot.send_document(
@@ -190,6 +216,40 @@ def _cleanup_files(job: WhisperJob):
         pass
 
 
+# --- Файлы из Telegram -----------------------------------------------------------
+# source_url вида "tg:<тип>:<file_id>". Файл скачивается через Bot API (лимит
+# Telegram — 20 МБ) и перегоняется в mp3, дальше — обычный путь.
+TG_TITLES = {"voice": "Голосовое сообщение", "video_note": "Видеосообщение (кружок)",
+             "audio": "Аудиофайл", "video": "Видео", "document": "Файл"}
+
+
+async def _download_telegram_file(bot, file_id: str, path: str):
+    await bot.download(file_id, destination=path)
+
+
+async def _download_telegram_media_raw(bot, url: str, post_id: int):
+    _, kind, file_id = url.split(":", 2)
+    os.makedirs(config.DOWNLOADS_DIR, exist_ok=True)
+    raw_path = os.path.join(config.DOWNLOADS_DIR, f"tg_{post_id}.bin")
+    await _download_telegram_file(bot, file_id, raw_path)
+    return raw_path, TG_TITLES.get(kind, "Файл")
+
+
+async def _download_telegram_media(bot, url: str, post_id: int):
+    _, kind, file_id = url.split(":", 2)
+    os.makedirs(config.DOWNLOADS_DIR, exist_ok=True)
+    raw_path = os.path.join(config.DOWNLOADS_DIR, f"tg_{post_id}.bin")
+    await _download_telegram_file(bot, file_id, raw_path)
+    try:
+        audio_path = await to_mp3(raw_path)
+    finally:
+        try:
+            os.remove(raw_path)
+        except OSError:
+            pass
+    return audio_path, TG_TITLES.get(kind, "Файл")
+
+
 # --- Этап 1: субтитры или скачивание (параллельно) ----------------------------
 
 async def _prepare(bot, post):
@@ -199,7 +259,8 @@ async def _prepare(bot, post):
             await update_post(post_id, status="downloading")
             await _edit_status(bot, post, _render_progress(post_id, post["mode"] or "post", "downloading"))
 
-            if config.USE_YOUTUBE_SUBTITLES:
+            # Ссылка на YouTube с субтитрами — текст берём из них, без распознавания.
+            if not url.startswith("tg:") and config.USE_YOUTUBE_SUBTITLES:
                 subs = await fetch_subtitles(url)
                 if subs:
                     title, text, label = subs
@@ -210,7 +271,10 @@ async def _prepare(bot, post):
                     _spawn(_finalize(bot, post_id, user_id))
                     return
 
-            audio_path, title = await download_audio(url)
+            if url.startswith("tg:"):
+                audio_path, title = await _download_telegram_media(bot, url, post_id)
+            else:
+                audio_path, title = await download_audio(url)
 
         if await _cancelled(post_id):
             try:
@@ -225,10 +289,9 @@ async def _prepare(bot, post):
         if user_id not in _RR_ORDER:
             _RR_ORDER.append(user_id)
         fresh = await get_post(post_id)
-        waiting = len(WHISPER_JOBS) - 1
         await _edit_status(bot, fresh, _render_progress(
-            post_id, fresh["mode"] or "post", "transcribing", title, chunk=f"0/{len(chunks)}",
-            extra=(f"👥 Распознавание общее: идёт по очереди ещё у {waiting} чел." if waiting else "")))
+            post_id, fresh["mode"] or "post", "transcribing", title, percent=0,
+            extra=BUSY_NOTE if len(WHISPER_JOBS) > 1 else ""))
         logger.info(f"Видео #{post_id}: {duration:.0f} сек, кусков: {len(chunks)}, в очереди Whisper: {len(WHISPER_JOBS)}")
     except Exception as e:
         await _fail(bot, post_id, user_id, e)
@@ -270,11 +333,10 @@ async def _whisper_loop(bot):
 
         post = await get_post(job.post_id)
         if len(job.texts) < len(job.chunks):
-            others = len(WHISPER_JOBS) - 1
             await _edit_status(bot, post, _render_progress(
                 job.post_id, post["mode"] or "post", "transcribing", job.title,
-                chunk=f"{len(job.texts)}/{len(job.chunks)}",
-                extra=(f"👥 Распознавание общее: идёт по очереди ещё у {others} чел." if others else "")))
+                percent=int(100 * len(job.texts) / len(job.chunks)),
+                extra=BUSY_NOTE if len(WHISPER_JOBS) > 1 else ""))
             continue
 
         WHISPER_JOBS.pop(job.user_id, None)
@@ -295,17 +357,15 @@ async def _finalize(bot, post_id: int, user_id: int):
         mode = post["mode"] or "post"
         title = post["video_title"] or ""
         transcript = post["transcript"]
-        from_subs = post["transcript_source"] == "subtitles"
         chat_id = _chat(post)
 
         await update_post(post_id, status="generating")
         prompt_note = ""
         if mode == "post":
             cp = post["custom_prompt"]
-            prompt_note = ("📸 Промпт для Reels" if cp and cp == config.INSTAGRAM_DEFAULT_PROMPT
+            prompt_note = ("📱 Пост для соц сетей" if cp and cp == config.SOCIAL_POST_PROMPT
                            else "🎯 Свой промпт" if cp else "📋 Базовый промпт")
-        await _edit_status(bot, post, _render_progress(post_id, mode, "generating", title,
-                                                       from_subtitles=from_subs, extra=prompt_note))
+        await _edit_status(bot, post, _render_progress(post_id, mode, "generating", title, extra=prompt_note))
 
         if mode == "transcript":
             translated = not is_mostly_russian(transcript)
@@ -317,7 +377,7 @@ async def _finalize(bot, post_id: int, user_id: int):
                 summary = None
             await update_post(post_id, status="done", draft_text=text)
             await _edit_status(bot, post, f"✅ Расшифровка #{post_id} готова\n🎬 {title}")
-            await _send_transcript(bot, chat_id, post_id, title, text, translated, summary, from_subs)
+            await _send_transcript(bot, chat_id, post_id, title, text, translated, summary)
         else:
             custom_prompt = post["custom_prompt"]
             draft = await generate_draft(transcript, custom_prompt)
@@ -330,6 +390,96 @@ async def _finalize(bot, post_id: int, user_id: int):
         await _fail(bot, post_id, user_id, e)
 
 
+# --- Скачивание видео / звука для пользователя (параллельно, мимо Whisper) -----
+
+def _safe_name(title: str) -> str:
+    import re
+    name = re.sub(r"[^\w\s.-]", "", title or "file", flags=re.UNICODE).strip()
+    return (name or "file")[:60]
+
+
+async def _send_media(bot, chat_id, mode, media, title, post_id, url):
+    """Отправляет видео/звук (путь к файлу или file_id из кэша). Возвращает file_id."""
+    kb = choice_keyboard(post_id, url, exclude=(mode,), with_cancel=False)
+    caption = f"🎬 {title}" if mode == "video" else f"🎵 {title}"
+    if isinstance(media, str) and os.path.exists(media):
+        ext = ".mp4" if mode == "video" else ".mp3"
+        media = FSInputFile(media, filename=_safe_name(title) + ext)
+    if mode == "video":
+        msg = await bot.send_video(chat_id, video=media, caption=caption[:1024], supports_streaming=True,
+                                   reply_markup=kb, request_timeout=300)
+        obj = msg.video or msg.document
+    else:
+        msg = await bot.send_audio(chat_id, audio=media, title=(title or "audio")[:64], caption=caption[:1024],
+                                   reply_markup=kb, request_timeout=300)
+        obj = msg.audio or msg.document
+    return obj.file_id if obj else None
+
+
+async def _deliver_media(bot, post):
+    post_id, user_id, url = post["id"], _owner(post), post["source_url"]
+    mode = post["mode"]
+    what = "видео" if mode == "video" else "звук"
+    chat_id = _chat(post)
+    path = None
+    try:
+        async with _DOWNLOAD_SLOTS:
+            await update_post(post_id, status="downloading")
+            await _edit_status(bot, post, f"⏳ Скачиваю {what} #{post_id}...")
+
+            cached = None if url.startswith("tg:") else await get_media_cache(url, mode)
+            if cached:
+                title = cached["title"] or ""
+                await _send_media(bot, chat_id, mode, cached["file_id"], title, post_id, url)
+                await update_post(post_id, status="done", video_title=title)
+                await _edit_status(bot, post, f"✅ Готово #{post_id}")
+                return _release(post_id, user_id)
+
+            if url.startswith("tg:"):
+                raw, title = await _download_telegram_media_raw(bot, url, post_id)
+                try:
+                    path = await extract_mp3(raw)
+                finally:
+                    try:
+                        os.remove(raw)
+                    except OSError:
+                        pass
+            elif mode == "video":
+                path, title = await download_video_file(url)
+            else:
+                path, title = await download_audio_file(url)
+
+        if await _cancelled(post_id):
+            return _release(post_id, user_id)
+
+        await _edit_status(bot, post, f"📤 Отправляю {what} #{post_id}...")
+        file_id = await _send_media(bot, chat_id, mode, path, title, post_id, url)
+        if file_id and not url.startswith("tg:"):
+            await save_media_cache(url, mode, file_id, title)
+        await update_post(post_id, status="done", video_title=title)
+        await _edit_status(bot, post, f"✅ Готово #{post_id}")
+        _release(post_id, user_id)
+    except TooLargeError:
+        await update_post(post_id, status="error", error_message="too large")
+        _release(post_id, user_id)
+        await _edit_status(bot, post, f"⚠️ #{post_id}: файл слишком большой")
+        if mode == "video":
+            text = ("Это видео не помещается в лимит Telegram (50 МБ) даже в низком качестве. "
+                    "Могу прислать звук или сделать расшифровку:")
+        else:
+            text = "Звук этого видео слишком длинный для Telegram (50 МБ). Могу сделать расшифровку:"
+        await bot.send_message(chat_id, text,
+                               reply_markup=choice_keyboard(post_id, url, exclude=(mode, "video"), with_cancel=False))
+    except Exception as e:
+        await _fail(bot, post_id, user_id, e)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 # --- Приём новых видео в работу -----------------------------------------------
 
 async def _intake_once(bot):
@@ -339,7 +489,9 @@ async def _intake_once(bot):
             continue   # у человека уже идёт видео — это подождёт своей очереди
         BUSY_USERS.add(user_id)
         ACTIVE_POSTS.add(post_id)
-        if post["transcript"]:
+        if (post["mode"] or "post") in DOWNLOAD_MODES:
+            _spawn(_deliver_media(bot, post))
+        elif post["transcript"]:
             # Текст уже есть (например, из расшифровки просят пост) — сразу к финалу.
             _spawn(_finalize(bot, post_id, user_id))
         else:

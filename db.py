@@ -66,9 +66,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+MEDIA_CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS media_cache (
+    source_url TEXT NOT NULL,
+    kind TEXT NOT NULL,          -- 'video' или 'audio'
+    file_id TEXT NOT NULL,       -- id файла в Telegram: пересылается без нового скачивания
+    title TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_url, kind)
+);
+"""
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(SCHEMA)
+        await db.execute(MEDIA_CACHE_SCHEMA)
         cursor = await db.execute("PRAGMA table_info(posts)")
         existing = {row[1] for row in await cursor.fetchall()}
         for column, sql in MIGRATIONS:
@@ -201,7 +214,25 @@ async def get_stats() -> dict:
             "errors_today": await one("SELECT COUNT(*) FROM posts WHERE status = 'error' AND created_at >= ?", today),
             "subtitles_today": await one(
                 "SELECT COUNT(*) FROM posts WHERE transcript_source = 'subtitles' AND created_at >= ?", today),
+            "downloads_today": await one(
+                "SELECT COUNT(*) FROM posts WHERE mode IN ('video','audio') AND created_at >= ?", today),
             "in_queue": await one("SELECT COUNT(*) FROM posts WHERE status = 'queued'"),
             "in_work": await one(
                 "SELECT COUNT(*) FROM posts WHERE status IN ('downloading','transcribing','generating')"),
         }
+
+
+async def get_media_cache(source_url: str, kind: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM media_cache WHERE source_url = ? AND kind = ?", (source_url, kind))
+        return await cursor.fetchone()
+
+
+async def save_media_cache(source_url: str, kind: str, file_id: str, title: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO media_cache (source_url, kind, file_id, title, created_at) "
+            "VALUES (?, ?, ?, ?, ?)", (source_url, kind, file_id, title, _now()))
+        await db.commit()

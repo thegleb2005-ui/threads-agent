@@ -198,3 +198,153 @@ async def fetch_subtitles(url: str):
         return None
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _fetch_subtitles_sync, url)
+
+
+# --- Скачивание файлов для отправки пользователю -------------------------------
+# Telegram даёт ботам отправлять файлы до 50 МБ. Видео подбираем по качеству
+# так, чтобы влезло; звук при необходимости пережимаем с меньшим битрейтом.
+import subprocess as _sp
+
+TELEGRAM_UPLOAD_LIMIT = 49 * 1024 * 1024   # с запасом от 50 МБ
+MIN_AUDIO_KBPS = 32
+MAX_AUDIO_KBPS = 128
+
+
+class TooLargeError(Exception):
+    """Даже в самом низком качестве файл больше лимита Telegram."""
+
+
+def _fsize(f: dict, duration: float) -> float | None:
+    size = f.get("filesize") or f.get("filesize_approx")
+    if not size and f.get("tbr") and duration:
+        size = f["tbr"] * 1000 / 8 * duration
+    return size
+
+
+def choose_video_formats(info: dict, limit: int = TELEGRAM_UPLOAD_LIMIT) -> list[str]:
+    """Список вариантов формата от лучшего к худшему, которые должны влезть в лимит.
+    Пустой список — у площадки нет данных о размерах (тогда пробуем «как есть»)."""
+    duration = info.get("duration") or 0
+    fmts = info.get("formats") or []
+    audios = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    videos = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") == "none"]
+    progressive = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
+
+    # Звук: m4a лучше всего склеивается с mp4; среди подходящих — самый лёгкий
+    # из нормальных по качеству (до ~130 кбит/с), чтобы оставить место картинке.
+    audios = [a for a in audios if _fsize(a, duration)]
+    audios.sort(key=lambda a: (a.get("ext") != "m4a", abs((a.get("abr") or 128) - 128)))
+    best_audio = audios[0] if audios else None
+
+    def is_h264(f):
+        return (f.get("vcodec") or "").startswith(("avc1", "h264"))
+
+    candidates = []
+    if best_audio:
+        a_size = _fsize(best_audio, duration)
+        for v in videos:
+            v_size = _fsize(v, duration)
+            if v_size and v_size + a_size <= limit * 0.95:
+                candidates.append((v.get("height") or 0, is_h264(v), f"{v['format_id']}+{best_audio['format_id']}"))
+    for f in progressive:
+        size = _fsize(f, duration)
+        if size and size <= limit * 0.95:
+            candidates.append((f.get("height") or 0, is_h264(f), f["format_id"]))
+    # Выше качество — лучше; при равном — H.264 (играет прямо в Telegram).
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    seen, result = set(), []
+    for _, _, fid in candidates:
+        if fid not in seen:
+            seen.add(fid)
+            result.append(fid)
+    return result
+
+
+def _probe(url: str):
+    """Информация о видео без скачивания. Возвращает (info, player_clients)."""
+    variants = PLAYER_CLIENT_FALLBACKS if _is_youtube(url) else [PLAYER_CLIENT_FALLBACKS[0]]
+    last_error = None
+    for clients in variants:
+        opts = _build_ydl_opts(DOWNLOADS_DIR, clients)
+        opts.pop("postprocessors", None)
+        opts["skip_download"] = True
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False), clients
+        except yt_dlp.utils.DownloadError as e:
+            last_error = e
+    raise last_error
+
+
+def _download_video_sync(url: str, out_dir: str) -> tuple[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+    info, clients = _probe(url)
+    title = info.get("title") or info.get("id") or "video"
+    choices = choose_video_formats(info)
+    if not choices:
+        # Нет данных о размерах (часто у Instagram/TikTok) — берём mp4 как есть и проверяем.
+        choices = ["best[ext=mp4]/best"]
+    for fmt in choices[:3]:
+        opts = _build_ydl_opts(out_dir, clients)
+        opts.pop("postprocessors", None)
+        opts.update({"format": fmt, "merge_output_format": "mp4",
+                     "outtmpl": os.path.join(out_dir, "%(id)s_video.%(ext)s")})
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            got = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(got)
+            path = os.path.splitext(path)[0] + ".mp4" if not os.path.exists(path) else path
+        if os.path.exists(path) and os.path.getsize(path) <= TELEGRAM_UPLOAD_LIMIT:
+            return path, title
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        logger.info(f"Видео в формате {fmt} оказалось больше лимита, пробую качество ниже")
+    raise TooLargeError("Видео слишком большое для Telegram даже в низком качестве.")
+
+
+def _duration_seconds(path: str) -> float:
+    out = _sp.run([FFMPEG_PATH, "-i", path], capture_output=True, text=True).stderr
+    m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0
+
+
+def fit_mp3(src: str, limit: int = TELEGRAM_UPLOAD_LIMIT, kbps: int = MAX_AUDIO_KBPS) -> str:
+    """Делает mp3 не больше лимита: битрейт подбирается по длительности,
+    при перелёте — ещё раз с битрейтом пониже."""
+    duration = _duration_seconds(src)
+    if duration:
+        kbps = min(kbps, int(limit * 8 / duration / 1000 * 0.9))
+    while kbps >= MIN_AUDIO_KBPS:
+        dst = os.path.splitext(src)[0] + f"_{kbps}k.mp3"
+        _sp.run([FFMPEG_PATH, "-y", "-i", src, "-vn", "-b:a", f"{kbps}k", dst], capture_output=True, check=True)
+        if os.path.getsize(dst) <= limit:
+            return dst
+        os.remove(dst)
+        kbps = int(kbps * 0.85)
+    raise TooLargeError("Аудио слишком длинное для Telegram даже в низком качестве.")
+
+
+def _download_audio_file_sync(url: str, out_dir: str) -> tuple[str, str]:
+    path, title = _download_sync(url, out_dir)          # mp3 128 кбит/с
+    if os.path.getsize(path) <= TELEGRAM_UPLOAD_LIMIT:
+        return path, title
+    smaller = fit_mp3(path)
+    os.remove(path)
+    return smaller, title
+
+
+async def download_video_file(url: str) -> tuple[str, str]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _download_video_sync, url, DOWNLOADS_DIR)
+
+
+async def download_audio_file(url: str) -> tuple[str, str]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _download_audio_file_sync, url, DOWNLOADS_DIR)
+
+
+async def extract_mp3(src: str) -> str:
+    """Звук из файла (например, кружка или видео из Telegram) в mp3."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fit_mp3, src)

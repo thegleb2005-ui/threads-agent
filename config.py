@@ -51,16 +51,17 @@ WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))
 # Длина куска аудио, секунды. Короче кусок — меньше пик памяти.
 WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "300"))
 
-# Для ссылок на YouTube сразу делать расшифровку на русском (true/false).
-# Пост вместо расшифровки можно выбрать кнопкой.
-YOUTUBE_DEFAULT_TRANSCRIPT = os.getenv("YOUTUBE_DEFAULT_TRANSCRIPT", "true").lower() in ("1", "true", "yes", "да")
-
-# Для Instagram Reels сразу делать пост по этому промпту (true/false).
-# Свой промпт можно прислать текстом в любой момент после ссылки.
-INSTAGRAM_DEFAULT_POST = os.getenv("INSTAGRAM_DEFAULT_POST", "true").lower() in ("1", "true", "yes", "да")
-INSTAGRAM_DEFAULT_PROMPT = os.getenv(
-    "INSTAGRAM_DEFAULT_PROMPT", "Сделай пост для тредс на английском языке по этому рилс"
+# Промпт для кнопки «Пост для соц сетей» — для любых ссылок и файлов.
+# (Старое имя переменной INSTAGRAM_DEFAULT_PROMPT тоже понимается.)
+SOCIAL_POST_PROMPT = (
+    os.getenv("SOCIAL_POST_PROMPT")
+    or os.getenv("INSTAGRAM_DEFAULT_PROMPT")
+    or "Сделай пост для тредс на английском языке по этому видео"
 )
+INSTAGRAM_DEFAULT_PROMPT = SOCIAL_POST_PROMPT  # совместимость со старым кодом
+
+# Telegram не даёт ботам скачивать файлы больше 20 МБ.
+TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- Доступ для всех пользователей ---
 # Пусто — бот открыт для всех. Иначе — только эти Telegram ID через запятую

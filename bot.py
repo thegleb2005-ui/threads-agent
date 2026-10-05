@@ -28,9 +28,9 @@ import config
 import downloader
 from db import (init_db, recover_stuck_posts, add_post, update_post, get_post,
                 count_user_posts_today, count_user_active, get_user_posts, get_stats, ACTIVE_STATUSES)
-from worker import process_queue_forever
+from worker import process_queue_forever, choice_keyboard, DOWNLOAD_MODES
 
-BOT_VERSION = "2026-10-04 v4: бот для всех, честная очередь, субтитры YouTube"
+BOT_VERSION = "2026-10-05 v6: скачивание видео и звука"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,40 +64,6 @@ class EditState(StatesGroup):
     waiting_for_text = State()
 
 
-def _prompt_choice_keyboard(post_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📝 Расшифровка на русском", callback_data=f"transcript:{post_id}")
-    kb.button(text="📋 Базовый промпт", callback_data=f"baseprompt:{post_id}")
-    kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
-    kb.adjust(1, 2)
-    return kb.as_markup()
-
-
-def _youtube_default_keyboard(post_id: int):
-    """Для YouTube расшифровка запускается сама (выбрана по умолчанию), но все
-    кнопки видны: можно переключиться на пост или отменить."""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Расшифровка на русском (по умолчанию)", callback_data=f"transcript:{post_id}")
-    kb.button(text="📋 Базовый промпт", callback_data=f"baseprompt:{post_id}")
-    kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
-    kb.adjust(1, 2)
-    return kb.as_markup()
-
-
-def _instagram_default_keyboard(post_id: int):
-    """Для Reels пост по промпту для Threads запускается сам, остальное — кнопками."""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Пост для Threads (по умолчанию)", callback_data=f"igpost:{post_id}")
-    kb.button(text="📝 Расшифровка на русском", callback_data=f"transcript:{post_id}")
-    kb.button(text="❌ Отмена", callback_data=f"cancel:{post_id}")
-    kb.adjust(1, 2)
-    return kb.as_markup()
-
-
-def _is_instagram(url: str) -> bool:
-    return "instagram.com" in url.lower()
-
-
 def _is_youtube(url: str) -> bool:
     u = url.lower()
     return "youtube.com" in u or "youtu.be" in u
@@ -108,7 +74,7 @@ def _draft_keyboard(post_id: int):
     kb.button(text="✅ Готово", callback_data=f"done:{post_id}")
     kb.button(text="✏️ Редактировать", callback_data=f"edit:{post_id}")
     kb.button(text="🗑 Удалить", callback_data=f"reject:{post_id}")
-    kb.adjust(3)
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -166,6 +132,8 @@ async def _apply_choice(post_id: int, chat_id: int, mode: str, custom_prompt: st
     if st in ("queued", "downloading", "transcribing"):
         if (post["mode"] or "post") == mode and (custom_prompt or None) == (post["custom_prompt"] or None):
             return "Уже делаю."
+        if mode in DOWNLOAD_MODES or (post["mode"] or "post") in DOWNLOAD_MODES:
+            return "Дождись, пока закончится текущее действие, и нажми кнопку ещё раз."
         await update_post(post_id, mode=mode, custom_prompt=custom_prompt)
         return "Ок, учту это, как только закончится распознавание."
     if st == "generating":
@@ -179,70 +147,88 @@ async def cmd_start(message: Message):
     if not await _allowed_or_tell(message):
         return
     await message.answer(
-        "Привет! Кидай ссылку на видео (YouTube, Instagram Reels, TikTok).\n\n"
-        "• YouTube — сразу делаю расшифровку: полный текст файлом и выжимку сутью видео "
-        "(если у видео есть субтитры — это займёт секунды).\n"
-        "• Instagram Reels — сразу делаю пост для Threads на английском.\n"
-        "• Остальные ссылки — спрошу, что сделать.\n"
-        "В любом случае можно просто написать свой промпт текстом.\n\n"
+        "Привет! Пришли ссылку на видео (YouTube, Instagram Reels, TikTok), "
+        "голосовое, кружок, видео или аудиофайл до 20 МБ.\n\n"
+        "Я спрошу, что сделать:\n"
+        "📝 Расшифровка на русском — полный текст файлом и выжимка сути\n"
+        "📱 Пост для соц сетей\n"
+        "🎬 Скачать видео / 🎵 звук (mp3) — до 50 МБ, качество подберу сам\n"
+        "Или просто напиши свой промпт для поста.\n\n"
         "Команды:\n"
         "/queue — что сейчас в обработке\n"
         "/pending — черновики, ожидающие решения"
     )
 
 
-@dp.message(_contains_video_link)
-async def handle_link(message: Message, state: FSMContext):
-    if not await _allowed_or_tell(message):
-        return
-    match = VIDEO_LINK_RE.search(message.text)
-    url = match.group(0)
+async def _limits_ok(message: Message) -> bool:
     uid = message.from_user.id
+    if _is_admin(uid):
+        return True
+    if config.DAILY_LIMIT_PER_USER and await count_user_posts_today(uid) >= config.DAILY_LIMIT_PER_USER:
+        await message.answer(f"На сегодня лимит исчерпан ({config.DAILY_LIMIT_PER_USER} видео в сутки). "
+                             f"Приходи завтра!")
+        return False
+    if await count_user_active(uid) >= config.MAX_QUEUED_PER_USER:
+        await message.answer(f"У тебя уже {config.MAX_QUEUED_PER_USER} видео в работе. "
+                             f"Дождись результата и присылай следующее. Список — /queue")
+        return False
+    return True
 
-    if not _is_admin(uid):
-        if config.DAILY_LIMIT_PER_USER and await count_user_posts_today(uid) >= config.DAILY_LIMIT_PER_USER:
-            await message.answer(f"На сегодня лимит исчерпан ({config.DAILY_LIMIT_PER_USER} видео в сутки). "
-                                 f"Приходи завтра!")
-            return
-        if await count_user_active(uid) >= config.MAX_QUEUED_PER_USER:
-            await message.answer(f"У тебя уже {config.MAX_QUEUED_PER_USER} видео в работе. "
-                                 f"Дождись результата и присылай следующее. Список — /queue")
-            return
 
+async def _offer_choice(message: Message, state: FSMContext, source: str, intro: str):
+    """Создаёт видео и показывает кнопки. Обработка начнётся только после выбора
+    (или после того, как пользователь напишет свой промпт)."""
     name = message.from_user.username or message.from_user.full_name or ""
-    post_id = await add_post(url, uid, name)
-
-    # Свой промпт можно прислать текстом в любой момент после ссылки.
+    post_id = await add_post(source, message.from_user.id, name)
     await state.update_data(pending_post_id=post_id)
     await state.set_state(PromptState.waiting_for_custom_prompt)
-
-    if config.YOUTUBE_DEFAULT_TRANSCRIPT and _is_youtube(url):
-        await message.answer(
-            f"🔗 Ссылка принята (#{post_id}).\n\n"
-            f"Для YouTube по умолчанию делаю расшифровку на русском — уже запустил.\n"
-            f"Нужен пост — жми «Базовый промпт» или просто напиши свой промпт.",
-            reply_markup=_youtube_default_keyboard(post_id),
-        )
-        await _start_processing(post_id, message.chat.id, None, mode="transcript")
-        return
-
-    if config.INSTAGRAM_DEFAULT_POST and _is_instagram(url):
-        await message.answer(
-            f"🔗 Ссылка принята (#{post_id}).\n\n"
-            f"Для Reels по умолчанию делаю пост для Threads на английском — уже запустил.\n"
-            f"Нужно по-другому — просто напиши свой промпт.",
-            reply_markup=_instagram_default_keyboard(post_id),
-        )
-        await _start_processing(post_id, message.chat.id, config.INSTAGRAM_DEFAULT_PROMPT, mode="post")
-        return
-
     await message.answer(
-        f"🔗 Ссылка принята (#{post_id}).\n\n"
-        f"Выбери, что сделать, или напиши свой промпт, например:\n"
-        f"• «сделай пост в 3 предложения, дерзкий тон»\n"
-        f"• «оставь как есть, только разбей на абзацы»",
-        reply_markup=_prompt_choice_keyboard(post_id),
+        f"{intro} (#{post_id})\n\nЧто сделать? Можно нажать кнопку или написать свой промпт для поста.",
+        reply_markup=choice_keyboard(post_id, source),
     )
+
+
+@dp.message(_contains_video_link)
+async def handle_link(message: Message, state: FSMContext):
+    if not await _allowed_or_tell(message) or not await _limits_ok(message):
+        return
+    url = VIDEO_LINK_RE.search(message.text).group(0)
+    await _offer_choice(message, state, url, "🔗 Ссылка принята")
+
+
+def _telegram_media(message: Message):
+    """(тип, file_id, размер, подпись) для голосовых, кружочков, видео и аудио."""
+    if message.voice:
+        return "voice", message.voice.file_id, message.voice.file_size, "🎙 Голосовое принято"
+    if message.video_note:
+        return "video_note", message.video_note.file_id, message.video_note.file_size, "⏺ Кружок принят"
+    if message.audio:
+        return "audio", message.audio.file_id, message.audio.file_size, "🎵 Аудио принято"
+    if message.video:
+        return "video", message.video.file_id, message.video.file_size, "🎬 Видео принято"
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith(("audio/", "video/")):
+        return "document", doc.file_id, doc.file_size, "📎 Файл принят"
+    return None
+
+
+@dp.message(F.voice | F.video_note | F.audio | F.video | F.document)
+async def handle_media(message: Message, state: FSMContext):
+    if not await _allowed_or_tell(message):
+        return
+    media = _telegram_media(message)
+    if media is None:
+        await message.answer("Пришли ссылку на видео, голосовое, кружок, видео или аудиофайл.")
+        return
+    kind, file_id, size, intro = media
+    if size and size > config.TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+        await message.answer(
+            f"Файл больше {config.TELEGRAM_FILE_LIMIT_MB} МБ — Telegram не даёт ботам скачивать такие. "
+            f"Пришли ссылку на видео или файл покороче.")
+        return
+    if not await _limits_ok(message):
+        return
+    await _offer_choice(message, state, f"tg:{kind}:{file_id}", intro)
 
 
 @dp.message(PromptState.waiting_for_custom_prompt, ~F.text.startswith("/"))
@@ -287,16 +273,16 @@ async def cb_base_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("igpost:"))
-async def cb_instagram_post(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("social:") | F.data.startswith("igpost:"))
+async def cb_social_post(callback: CallbackQuery, state: FSMContext):
     post_id = int(callback.data.split(":")[1])
     if not await _owns(callback.from_user.id, post_id):
         await callback.answer("Это видео другого пользователя", show_alert=True)
         return
     await state.update_data(pending_post_id=post_id)
     await state.set_state(PromptState.waiting_for_custom_prompt)
-    result = await _apply_choice(post_id, callback.message.chat.id, "post", config.INSTAGRAM_DEFAULT_PROMPT)
-    await _mark_choice(callback, f"📸 Пост для Threads. {result}")
+    result = await _apply_choice(post_id, callback.message.chat.id, "post", config.SOCIAL_POST_PROMPT)
+    await _mark_choice(callback, f"📱 Пост для соц сетей. {result}")
     await callback.answer()
 
 
@@ -311,6 +297,28 @@ async def cb_transcript(callback: CallbackQuery, state: FSMContext):
     result = await _apply_choice(post_id, callback.message.chat.id, "transcript", None)
     await _mark_choice(callback, f"📝 Расшифровка на русском. {result}")
     await callback.answer()
+
+
+async def _download_choice(callback: CallbackQuery, state: FSMContext, mode: str, note: str):
+    post_id = int(callback.data.split(":")[1])
+    if not await _owns(callback.from_user.id, post_id):
+        await callback.answer("Это видео другого пользователя", show_alert=True)
+        return
+    await state.update_data(pending_post_id=post_id)
+    await state.set_state(PromptState.waiting_for_custom_prompt)
+    result = await _apply_choice(post_id, callback.message.chat.id, mode, None)
+    await _mark_choice(callback, f"{note} {result}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("dlvideo:"))
+async def cb_download_video(callback: CallbackQuery, state: FSMContext):
+    await _download_choice(callback, state, "video", "🎬 Скачиваю видео.")
+
+
+@dp.callback_query(F.data.startswith("dlaudio:"))
+async def cb_download_audio(callback: CallbackQuery, state: FSMContext):
+    await _download_choice(callback, state, "audio", "🎵 Скачиваю звук.")
 
 
 @dp.callback_query(F.data.startswith("customprompt:"))
@@ -376,7 +384,8 @@ async def cmd_stats(message: Message):
     await message.answer(
         f"📊 Статистика\n\n"
         f"Пользователей всего: {s['users_total']}, сегодня: {s['users_today']}\n"
-        f"Видео сегодня: {s['videos_today']} (из субтитров: {s['subtitles_today']}, ошибок: {s['errors_today']})\n"
+        f"Видео сегодня: {s['videos_today']} (из субтитров: {s['subtitles_today']}, "
+        f"скачиваний: {s['downloads_today']}, ошибок: {s['errors_today']})\n"
         f"Сейчас в очереди: {s['in_queue']}, в работе: {s['in_work']}\n\n"
         f"Доступ: {'только список ALLOWED_USERS' if config.ALLOWED_USERS else 'открыт для всех'}, "
         f"лимит: {config.DAILY_LIMIT_PER_USER or 'без лимита'} видео/сутки на человека"
@@ -459,8 +468,7 @@ async def main():
     logger.info(
         f"ВЕРСИЯ БОТА: {BOT_VERSION} | Whisper: модель={config.WHISPER_MODEL_SIZE}, "
         f"beam={config.WHISPER_BEAM_SIZE}, ядер={config.WHISPER_CPU_THREADS}, "
-        f"кусок={_tr.CHUNK_SECONDS}с | YouTube по умолчанию: "
-        f"{'расшифровка' if config.YOUTUBE_DEFAULT_TRANSCRIPT else 'спрашивать'} | "
+        f"кусок={_tr.CHUNK_SECONDS}с | "
         f"доступ: {'список' if config.ALLOWED_USERS else 'все'}, лимит {config.DAILY_LIMIT_PER_USER}/сутки, "
         f"субтитры YouTube: {'да' if config.USE_YOUTUBE_SUBTITLES else 'нет'}"
     )

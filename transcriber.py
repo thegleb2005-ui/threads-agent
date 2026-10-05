@@ -459,3 +459,22 @@ async def transcribe_chunk(chunk_path: str) -> str:
     """Распознаёт один кусок (с защитой от нехватки памяти)."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _transcribe_file_sync, chunk_path)
+
+
+
+# --- Файлы из Telegram (голосовые, кружочки, видео, аудио) ------------------
+
+def _to_mp3_sync(src_path: str) -> str:
+    """Перегоняет любой аудио/видеофайл в лёгкий mp3 (моно, 16 кГц) — дальше
+    он идёт по обычному пути: нарезка на куски и распознавание."""
+    dst = os.path.splitext(src_path)[0] + "_audio.mp3"
+    subprocess.run(
+        [FFMPEG_PATH, "-y", "-i", src_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst],
+        capture_output=True, check=True,
+    )
+    return dst
+
+
+async def to_mp3(src_path: str) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _to_mp3_sync, src_path)
