@@ -29,7 +29,7 @@ from aiogram.types import BufferedInputFile, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
-from db import get_all_queued, get_post, update_post, get_media_cache, save_media_cache
+from db import get_all_queued, get_post, update_post, get_media_cache, save_media_cache, log_event
 from downloader import (download_audio, fetch_subtitles, download_video_file,
                         download_audio_file, extract_mp3, TooLargeError)
 from transcriber import split_for_whisper, transcribe_chunk, current_model, to_mp3
@@ -77,6 +77,13 @@ def _spawn(coro):
 def _release(post_id: int, user_id: int):
     ACTIVE_POSTS.discard(post_id)
     BUSY_USERS.discard(user_id)
+
+
+async def _event(user_id, type_, detail=""):
+    try:
+        await log_event(user_id, type_, detail)
+    except Exception:
+        logger.exception("Не удалось записать событие")
 
 
 def _owner(post) -> int:
@@ -191,6 +198,8 @@ async def _send_transcript(bot, chat_id: int, post_id: int, title: str, text: st
 
 async def _fail(bot, post_id: int, user_id: int, error: Exception | str):
     logger.error(f"Видео #{post_id}: ошибка — {error}")
+    fresh = await get_post(post_id)
+    await _event(user_id, "error", (fresh["mode"] if fresh else "") or "")
     await update_post(post_id, status="error", error_message=str(error)[:2000])
     post = await get_post(post_id)
     _release(post_id, user_id)
@@ -378,6 +387,7 @@ async def _finalize(bot, post_id: int, user_id: int):
             await update_post(post_id, status="done", draft_text=text)
             await _edit_status(bot, post, f"✅ Расшифровка #{post_id} готова\n🎬 {title}")
             await _send_transcript(bot, chat_id, post_id, title, text, translated, summary)
+            await _event(user_id, "done", "transcript")
         else:
             custom_prompt = post["custom_prompt"]
             draft = await generate_draft(transcript, custom_prompt)
@@ -385,6 +395,7 @@ async def _finalize(bot, post_id: int, user_id: int):
             await _edit_status(bot, post, f"✅ Пост #{post_id} готов\n🎬 {title}")
             await bot.send_message(chat_id, f"📝 Черновик поста #{post_id}\n\n{draft}",
                                    reply_markup=_draft_keyboard(post_id))
+            await _event(user_id, "done", "post")
         _release(post_id, user_id)
     except Exception as e:
         await _fail(bot, post_id, user_id, e)
@@ -433,6 +444,7 @@ async def _deliver_media(bot, post):
                 await _send_media(bot, chat_id, mode, cached["file_id"], title, post_id, url)
                 await update_post(post_id, status="done", video_title=title)
                 await _edit_status(bot, post, f"✅ Готово #{post_id}")
+                await _event(user_id, "done", mode)
                 return _release(post_id, user_id)
 
             if url.startswith("tg:"):
@@ -458,8 +470,10 @@ async def _deliver_media(bot, post):
             await save_media_cache(url, mode, file_id, title)
         await update_post(post_id, status="done", video_title=title)
         await _edit_status(bot, post, f"✅ Готово #{post_id}")
+        await _event(user_id, "done", mode)
         _release(post_id, user_id)
     except TooLargeError:
+        await _event(user_id, "error", f"{mode}_too_large")
         await update_post(post_id, status="error", error_message="too large")
         _release(post_id, user_id)
         await _edit_status(bot, post, f"⚠️ #{post_id}: файл слишком большой")

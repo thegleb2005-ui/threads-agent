@@ -13,12 +13,14 @@
 Запуск: python bot.py  (см. README.md для полной инструкции по деплою)
 """
 import asyncio
+import os
+import tempfile
 import logging
 import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,17 +28,51 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 import downloader
-from db import (init_db, recover_stuck_posts, add_post, update_post, get_post,
+import stats
+from db import (touch_user, log_event, init_db, recover_stuck_posts, add_post, update_post, get_post,
                 count_user_posts_today, count_user_active, get_user_posts, get_stats, ACTIVE_STATUSES)
 from worker import process_queue_forever, choice_keyboard, DOWNLOAD_MODES
 
-BOT_VERSION = "2026-10-05 v6: скачивание видео и звука"
+BOT_VERSION = "2026-10-05 v7: статистика, постоянная база, ежедневная копия"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+async def _track_user(handler, event, data):
+    """Отмечает визит пользователя (для статистики). Ошибка учёта не мешает боту."""
+    user = getattr(event, "from_user", None)
+    if user and not user.is_bot:
+        try:
+            await touch_user(user.id, user.username or "", user.full_name or "", user.language_code or "")
+        except Exception:
+            logger.exception("Не удалось отметить пользователя")
+    return await handler(event, data)
+
+
+dp.message.outer_middleware(_track_user)
+dp.callback_query.outer_middleware(_track_user)
+
+
+def _platform(url: str) -> str:
+    u = url.lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return "youtube"
+    if "instagram.com" in u:
+        return "instagram"
+    if "tiktok.com" in u:
+        return "tiktok"
+    return "other"
+
+
+async def _event(user_id, type_, detail=""):
+    try:
+        await log_event(user_id, type_, detail)
+    except Exception:
+        logger.exception("Не удалось записать событие")
 
 # Поддерживаемые площадки. yt-dlp умеет скачивать со всех трёх, но
 # Instagram и TikTok заметно агрессивнее блокируют запросы с серверных IP,
@@ -115,7 +151,23 @@ async def _start_processing(post_id: int, chat_id: int, custom_prompt: str | Non
     )
 
 
+def _choice_detail(mode: str, custom_prompt: str | None) -> str:
+    if mode != "post":
+        return mode
+    if not custom_prompt:
+        return "base"
+    return "social" if custom_prompt == config.SOCIAL_POST_PROMPT else "custom"
+
+
 async def _apply_choice(post_id: int, chat_id: int, mode: str, custom_prompt: str | None) -> str:
+    result = await _apply_choice_inner(post_id, chat_id, mode, custom_prompt)
+    if not result.startswith(("Уже", "Дождись", "Сейчас идёт", "Видео не найдено")):
+        post = await get_post(post_id)
+        await _event(post["user_id"] if post else None, "choice", _choice_detail(mode, custom_prompt))
+    return result
+
+
+async def _apply_choice_inner(post_id: int, chat_id: int, mode: str, custom_prompt: str | None) -> str:
     """Применяет выбор (расшифровка / пост) в любой момент жизни видео:
       - ещё не запускали — запускаем;
       - качается или распознаётся — меняем режим, воркер учтёт его в конце;
@@ -146,6 +198,7 @@ async def _apply_choice(post_id: int, chat_id: int, mode: str, custom_prompt: st
 async def cmd_start(message: Message):
     if not await _allowed_or_tell(message):
         return
+    await _event(message.from_user.id, "start")
     await message.answer(
         "Привет! Пришли ссылку на видео (YouTube, Instagram Reels, TikTok), "
         "голосовое, кружок, видео или аудиофайл до 20 МБ.\n\n"
@@ -165,10 +218,12 @@ async def _limits_ok(message: Message) -> bool:
     if _is_admin(uid):
         return True
     if config.DAILY_LIMIT_PER_USER and await count_user_posts_today(uid) >= config.DAILY_LIMIT_PER_USER:
+        await _event(uid, "limit", "daily")
         await message.answer(f"На сегодня лимит исчерпан ({config.DAILY_LIMIT_PER_USER} видео в сутки). "
                              f"Приходи завтра!")
         return False
     if await count_user_active(uid) >= config.MAX_QUEUED_PER_USER:
+        await _event(uid, "limit", "queue")
         await message.answer(f"У тебя уже {config.MAX_QUEUED_PER_USER} видео в работе. "
                              f"Дождись результата и присылай следующее. Список — /queue")
         return False
@@ -193,6 +248,7 @@ async def handle_link(message: Message, state: FSMContext):
     if not await _allowed_or_tell(message) or not await _limits_ok(message):
         return
     url = VIDEO_LINK_RE.search(message.text).group(0)
+    await _event(message.from_user.id, "link", _platform(url))
     await _offer_choice(message, state, url, "🔗 Ссылка принята")
 
 
@@ -212,7 +268,7 @@ def _telegram_media(message: Message):
     return None
 
 
-@dp.message(F.voice | F.video_note | F.audio | F.video | F.document)
+@dp.message((F.voice | F.video_note | F.audio | F.video | F.document) & ~F.caption.startswith("/restore"))
 async def handle_media(message: Message, state: FSMContext):
     if not await _allowed_or_tell(message):
         return
@@ -228,10 +284,11 @@ async def handle_media(message: Message, state: FSMContext):
         return
     if not await _limits_ok(message):
         return
+    await _event(message.from_user.id, "media", kind)
     await _offer_choice(message, state, f"tg:{kind}:{file_id}", intro)
 
 
-@dp.message(PromptState.waiting_for_custom_prompt, ~F.text.startswith("/"))
+@dp.message(PromptState.waiting_for_custom_prompt, F.text, ~F.text.startswith("/"))
 async def handle_custom_prompt(message: Message, state: FSMContext):
     if not await _allowed_or_tell(message):
         return
@@ -341,6 +398,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await update_post(post_id, status="rejected")
+    await _event(callback.from_user.id, "cancel")
     await callback.message.edit_text(f"❌ Отменено (#{post_id}).")
     await callback.answer()
 
@@ -380,16 +438,37 @@ async def cmd_pending(message: Message):
 async def cmd_stats(message: Message):
     if not _is_admin(message.from_user.id):
         return
-    s = await get_stats()
-    await message.answer(
-        f"📊 Статистика\n\n"
-        f"Пользователей всего: {s['users_total']}, сегодня: {s['users_today']}\n"
-        f"Видео сегодня: {s['videos_today']} (из субтитров: {s['subtitles_today']}, "
-        f"скачиваний: {s['downloads_today']}, ошибок: {s['errors_today']})\n"
-        f"Сейчас в очереди: {s['in_queue']}, в работе: {s['in_work']}\n\n"
-        f"Доступ: {'только список ALLOWED_USERS' if config.ALLOWED_USERS else 'открыт для всех'}, "
-        f"лимит: {config.DAILY_LIMIT_PER_USER or 'без лимита'} видео/сутки на человека"
-    )
+    await message.answer(await stats.full_stats_text())
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    for name, data in await stats.export_files():
+        await message.answer_document(BufferedInputFile(data, filename=name))
+    await message.answer("Файлы открываются в Excel. users — пользователи, events — все действия, videos — видео.")
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    await stats.send_backup(bot, message.chat.id)
+
+
+@dp.message(F.document, F.caption.startswith("/restore"))
+async def cmd_restore(message: Message):
+    if not _is_admin(message.from_user.id):
+        return
+    path = os.path.join(tempfile.gettempdir(), f"restore_{message.message_id}.db")
+    await bot.download(message.document.file_id, destination=path)
+    try:
+        users = await asyncio.get_event_loop().run_in_executor(None, stats.restore_from_file, path)
+    except Exception as e:
+        await message.answer(f"Не получилось восстановить: {e}")
+        return
+    await message.answer(f"✅ База восстановлена из копии. Пользователей в ней: {users}.")
 
 
 @dp.callback_query(F.data.startswith("done:"))
@@ -428,7 +507,7 @@ async def cb_edit(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(EditState.waiting_for_text, ~F.text.startswith("/"))
+@dp.message(EditState.waiting_for_text, F.text, ~F.text.startswith("/"))
 async def process_edit(message: Message, state: FSMContext):
     if not await _allowed_or_tell(message):
         return
@@ -464,13 +543,14 @@ async def main():
     cookies_status = "используются" if downloader._cookies_active() else "НЕ используются"
 
     asyncio.create_task(process_queue_forever(bot, config.ADMIN_USER_ID))
+    asyncio.create_task(stats.report_loop(bot, config.ADMIN_USER_ID))
     import transcriber as _tr
     logger.info(
         f"ВЕРСИЯ БОТА: {BOT_VERSION} | Whisper: модель={config.WHISPER_MODEL_SIZE}, "
         f"beam={config.WHISPER_BEAM_SIZE}, ядер={config.WHISPER_CPU_THREADS}, "
         f"кусок={_tr.CHUNK_SECONDS}с | "
         f"доступ: {'список' if config.ALLOWED_USERS else 'все'}, лимит {config.DAILY_LIMIT_PER_USER}/сутки, "
-        f"субтитры YouTube: {'да' if config.USE_YOUTUBE_SUBTITLES else 'нет'}"
+        f"субтитры YouTube: {'да' if config.USE_YOUTUBE_SUBTITLES else 'нет'} | база: {config.DB_PATH}"
     )
     logger.info(
         f"Бот запущен, жду сообщений... "

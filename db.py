@@ -17,6 +17,10 @@
 """
 import aiosqlite
 from datetime import datetime, timezone
+import os
+import shutil
+
+import config
 from config import DB_PATH
 
 SCHEMA = """
@@ -47,6 +51,13 @@ CREATE TABLE IF NOT EXISTS posts (
 # ALTER TABLE — CREATE TABLE IF NOT EXISTS сам по себе старую таблицу
 # не обновляет.
 MIGRATIONS = [
+    # Колонки самой первой версии — на случай совсем старой базы
+    ("video_title", "ALTER TABLE posts ADD COLUMN video_title TEXT"),
+    ("transcript", "ALTER TABLE posts ADD COLUMN transcript TEXT"),
+    ("draft_text", "ALTER TABLE posts ADD COLUMN draft_text TEXT"),
+    ("threads_post_id", "ALTER TABLE posts ADD COLUMN threads_post_id TEXT"),
+    ("error_message", "ALTER TABLE posts ADD COLUMN error_message TEXT"),
+    ("published_at", "ALTER TABLE posts ADD COLUMN published_at TEXT"),
     ("custom_prompt", "ALTER TABLE posts ADD COLUMN custom_prompt TEXT"),
     ("status_chat_id", "ALTER TABLE posts ADD COLUMN status_chat_id INTEGER"),
     ("status_message_id", "ALTER TABLE posts ADD COLUMN status_message_id INTEGER"),
@@ -78,10 +89,48 @@ CREATE TABLE IF NOT EXISTS media_cache (
 """
 
 
+STATS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,
+    username    TEXT,
+    full_name   TEXT,
+    language    TEXT,
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER,
+    type        TEXT NOT NULL,   -- start, link, media, choice, cancel, done, error, limit
+    detail      TEXT,            -- платформа, тип файла, выбранное действие и т.п.
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, created_at);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
+def _move_legacy_db():
+    """Первый запуск с постоянной папкой: переносим туда старую базу, чтобы не потерять данные."""
+    if DB_PATH == config.LEGACY_DB_PATH:
+        return
+    folder = os.path.dirname(DB_PATH)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(DB_PATH) and os.path.exists(config.LEGACY_DB_PATH):
+        shutil.copy2(config.LEGACY_DB_PATH, DB_PATH)
+
+
 async def init_db():
+    _move_legacy_db()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(SCHEMA)
         await db.execute(MEDIA_CACHE_SCHEMA)
+        await db.executescript(STATS_SCHEMA)
         cursor = await db.execute("PRAGMA table_info(posts)")
         existing = {row[1] for row in await cursor.fetchall()}
         for column, sql in MIGRATIONS:
@@ -236,3 +285,49 @@ async def save_media_cache(source_url: str, kind: str, file_id: str, title: str)
             "INSERT OR REPLACE INTO media_cache (source_url, kind, file_id, title, created_at) "
             "VALUES (?, ?, ?, ?, ?)", (source_url, kind, file_id, title, _now()))
         await db.commit()
+
+
+
+# --- Пользователи и журнал действий (статистика) ------------------------------
+
+async def touch_user(user_id: int, username: str = "", full_name: str = "", language: str = ""):
+    """Отмечает визит: новый пользователь появляется в базе, у старого обновляется время."""
+    now = _now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO users (user_id, username, full_name, language, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+            "username = excluded.username, full_name = excluded.full_name, last_seen = excluded.last_seen",
+            (user_id, username, full_name, language, now, now))
+        await db.commit()
+
+
+async def log_event(user_id: int | None, type_: str, detail: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO events (user_id, type, detail, created_at) VALUES (?, ?, ?, ?)",
+                         (user_id, type_, detail, _now()))
+        await db.commit()
+
+
+async def get_meta(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT value FROM meta WHERE key = ?", (key,))).fetchone()
+        return row[0] if row else None
+
+
+async def set_meta(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+        await db.commit()
+
+
+async def query(sql: str, *args):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        return await (await db.execute(sql, args)).fetchall()
+
+
+async def scalar(sql: str, *args):
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(sql, args)).fetchone()
+        return row[0] if row else 0

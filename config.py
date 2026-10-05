@@ -90,7 +90,14 @@ POST_LANGUAGE = os.getenv("POST_LANGUAGE", "English")
 POST_STYLE_PROMPT = os.getenv("POST_STYLE_PROMPT", "")
 
 # --- Пути ---
-DB_PATH = os.getenv("DB_PATH", "agent.db")
+# База данных. Bothost задаёт DATA_DIR=/app/data — папку, которая должна
+# сохраняться между пересборками. Если её нет (локальный запуск) — рядом с кодом.
+DATA_DIR = os.getenv("DATA_DIR", "")
+DB_PATH = os.getenv("DB_PATH") or (os.path.join(DATA_DIR, "agent.db") if DATA_DIR else "agent.db")
+LEGACY_DB_PATH = "agent.db"   # старое место: при первом запуске база переносится отсюда
+
+# Ежедневный отчёт и резервная копия базы админу. Час по UTC (6 = 09:00 по Москве).
+DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "6"))
 DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
 
 # Запасной путь на случай, если YouTube всё равно блокирует скачивание
